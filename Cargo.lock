@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "kube-portforward"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "spdy-mux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
