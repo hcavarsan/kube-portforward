@@ -1,6 +1,3 @@
-//! Shared helpers: deploy/teardown a throwaway nginx pod.
-//! Included via `#[path = "common.rs"] mod common;`.
-
 #![allow(dead_code, unreachable_pub)]
 
 use std::time::Duration;
@@ -22,7 +19,7 @@ use kube::runtime::wait::{
 };
 use serde_json::json;
 
-/// Create `namespace/name` running `nginx:alpine`, wait up to 90s for Ready.
+/// Create nginx pod, wait up to 90s for Ready.
 pub async fn ensure_nginx_pod(
     kube_client: &kube::Client, namespace: &str, name: &str,
 ) -> Result<String> {
@@ -64,7 +61,6 @@ pub async fn ensure_nginx_pod(
     }
 }
 
-/// Best-effort delete. Errors logged, not propagated.
 pub async fn delete_pod(kube_client: &kube::Client, namespace: &str, name: &str) {
     let pods: Api<Pod> = Api::namespaced(kube_client.clone(), namespace);
     match pods.delete(name, &DeleteParams::default()).await {
@@ -73,8 +69,8 @@ pub async fn delete_pod(kube_client: &kube::Client, namespace: &str, name: &str)
     }
 }
 
-/// Force-delete (grace=0) then wait until the pod is fully gone from the
-/// apiserver. Used to simulate an instant pod restart.
+/// Delete then wait until the pod is fully gone from the
+/// apiserver to simulate a pod restart.
 pub async fn force_delete_and_wait(
     kube_client: &kube::Client, namespace: &str, name: &str,
 ) -> Result<()> {

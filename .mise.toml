@@ -1,5 +1,5 @@
 [tools]
-# No tool pins beyond rust-toolchain.toml; cargo-release installed lazily by the release task.
+
 
 [tasks.build]
 description = "Build the workspace (debug)"

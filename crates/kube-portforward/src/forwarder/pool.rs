@@ -48,7 +48,7 @@ impl SessionPool {
     }
 
     /// Rebuild the lock-free snapshot from current entries.
-    /// MUST be called after every mutation to `entries` so concurrent
+    /// Must be called after every mutation to `entries` so concurrent
     /// readers see a consistent view.
     pub(super) fn refresh_snapshot(&self) {
         let sessions: Vec<Arc<Session>> = self
@@ -74,7 +74,7 @@ impl SessionPool {
 ///
 /// Incrementing `opening_count` is paired with decrement-on-drop so callers
 /// that get cancelled mid-await (e.g. dropped future, timeout) cannot leak
-/// slots. The slot is held for the duration of the open attempt; on drop
+/// slots. The slot is held for the duration of the open try; on drop
 /// (success OR cancellation OR error) the counter is decremented.
 #[must_use = "OpeningSlot decrements opening_count on drop; bind to a variable"]
 pub(super) struct OpeningSlot {
@@ -161,7 +161,7 @@ impl Forwarder {
         }
     }
 
-    /// Lock-free fast path: scan the snapshot (lock-free atomic load).
+    /// scan the snapshot (lock-free atomic load).
     /// The hot queue serves as a recency hint via `refresh_snapshot`, but
     /// reads use the snapshot directly to avoid pop-then-push-back races
     /// that can drop valid sessions when the queue is full.
@@ -175,7 +175,6 @@ impl Forwarder {
         None
     }
 
-    /// Lock-free fast path with prefetch trigger.
     pub(super) async fn try_reuse_session(
         &self, target_port: u16, pod_uid: &str, pod_name: &str,
     ) -> Option<Arc<Session>> {
@@ -183,7 +182,7 @@ impl Forwarder {
         for session in snap.iter() {
             if !session.cancellation_token().is_cancelled() && !session.is_full() {
                 let chosen = Arc::clone(session);
-                // Release the snapshot guard before awaiting.
+                // release the snapshot guard before awaiting.
                 drop(snap);
                 self.maybe_prefetch(
                     &chosen,
@@ -198,9 +197,7 @@ impl Forwarder {
         None
     }
 
-    /// Reserve a slot for a new session, returning an RAII guard that
-    /// decrements `opening_count` on drop. This guarantees the slot is
-    /// released even if the caller's future is cancelled mid-await.
+    /// Reserve a slot for a new session
     pub(super) async fn reserve_new_slot(&self) -> Result<OpeningSlot, crate::error::Error> {
         let pool = self.sessions.write().await;
         let projected = pool.entries.len() + pool.opening_count.load(Ordering::Relaxed);

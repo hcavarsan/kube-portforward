@@ -1,17 +1,17 @@
-//! Kubernetes port-forward over SPDY/3.1 with kubectl-style fallback.
+//! Kubernetes port-forward over SPDY
 //!
 //! Speaks `SPDY/3.1+portforward.k8s.io` (tunnelled inside WebSocket
 //! binary messages) by default, falling back to the legacy `Upgrade:
-//! SPDY/3.1` path against apiservers that reject the WebSocket
-//! subprotocol. Multiplexes many concurrent local TCP connections over a
-//! small pool of upgraded connections using the SPDY/3.1 frame format.
+//! SPDY/3.1` path when the apiserver rejects the WebSocket subprotocol.
+//! Multiplexes many concurrent local TCP connections over a small pool of
+//! upgraded connections using the SPDY/3.1 frame format.
 //!
 //! ## Why not `kube::Api::portforward`?
 //!
 //! `kube::Api::portforward` opens a new WebSocket upgrade for every stream
-//! pair, lacks keepalive, and surfaces opaque errors. This crate
+//! pair, has no keepalive, and gives you opaque errors. This crate
 //! multiplexes many stream pairs per upgrade, runs a Ping/Pong watchdog,
-//! exposes structured `thiserror` errors, and gracefully degrades to the
+//! exposes structured `thiserror` errors, and gracefully falls back to the
 //! legacy SPDY/3.1 path when the apiserver is too old for KEP-4006.
 //!
 //! ## Quick Start

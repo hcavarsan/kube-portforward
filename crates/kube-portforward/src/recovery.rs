@@ -1,13 +1,12 @@
-//! Session-level recovery signalling.
+//! Session level recovery signalling.
 //!
-//! [`RecoverySignal`] is emitted when the port-forward session detects a
-//! condition the caller may want to react to (typically by rebuilding the
+//! [`RecoverySignal`] fires when the port-forward session detects a
+//! condition the caller might want to react to (typically by rebuilding the
 //! session). Callers register a [`RecoveryCallback`] on the
 //! [`SessionBuilder`](crate::SessionBuilder) or
-//! [`ForwarderBuilder`](crate::ForwarderBuilder) to receive these events.
+//! [`ForwarderBuilder`](crate::ForwarderBuilder) to get these events.
 //!
-//! Callbacks run on internal tasks and must be cheap (typically a channel
-//! send).
+//! Callbacks run on internal tasks and should be cheap
 
 use std::sync::Arc;
 use std::time::Duration;

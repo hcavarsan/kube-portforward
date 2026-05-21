@@ -130,7 +130,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
 
     let mut codec = SpdyCodec::with_max_frame_size(config.max_frame_size);
 
-    // Send initial PING (ID 1) before entering the main loop.
+    // send initial PING (ID 1) before entering the main loop.
     {
         let ping_frame = codec.encode_ping(1);
         tracing::debug!("SPDY writer: sending initial PING");
@@ -165,7 +165,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
         }
     }
 
-    // Send our SETTINGS frame right after initial PING.
+    // send our SETTINGS frame right after initial PING.
     {
         let settings_entries = vec![
             (7, config.initial_window_size),    // SETTINGS_INITIAL_WINDOW_SIZE
@@ -215,7 +215,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_interval.tick().await; // skip immediate first tick
 
-    // Writer stall watchdog: track time of last successful flush. If progress
+    // writer stall watchdog: track time of last successful flush. If progress
     // stalls past 2× write_timeout while commands are queued, kill the handle.
     let mut last_writer_progress = tokio::time::Instant::now();
     let mut stall_check = tokio::time::interval(Duration::from_secs(5));
@@ -225,7 +225,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
     let write_timeout = config.write_timeout;
     let mut ping_id: u32 = 3;
     let mut had_error = false;
-    // Close notifications deferred until after flush. Decouples the wire
+    // close notifications deferred until after flush. Decouples the wire
     // write path from the worker's close_reg_tx drain rate: the batch
     // encodes RST_STREAM frames at full speed, flushes them, THEN notifies
     // the workers about closed streams. This is an OPTIMIZATION path;
@@ -249,8 +249,8 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
 
             () = cancel.cancelled() => break,
 
-            // HIGHEST PRIORITY: drain WINDOW_UPDATE channel.
-            // Flow-control frames must never be delayed. A stalled
+            // highest priority: drain WINDOW_UPDATE channel.
+            // flow-control frames must never be delayed. A stalled
             // WINDOW_UPDATE causes the peer to stop sending, deadlocking
             // the entire session.
             win = window_rx.recv() => {
@@ -264,7 +264,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                 bytes_since_flush += n;
                 if batch_start.is_none() && n > 0 { batch_start = Some(tokio::time::Instant::now()); }
                 if err { had_error = true; }
-                // Drain all pending WINDOW_UPDATEs -- they're tiny and critical.
+                // drain all pending WINDOW_UPDATEs -- they're tiny and critical.
                 if !had_error {
                     while let Ok(c) = window_rx.try_recv() {
                         let (err, n) = process_writer_command(
@@ -279,7 +279,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                 }
             }
 
-            // Priority: drain control channel (one + opportunistic).
+            // priority: drain control channel (one + opportunistic).
             ctrl = control_rx.recv() => {
                 let Some(cmd) = ctrl else {
                     tracing::debug!("SPDY writer: control channel closed");
@@ -291,7 +291,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                 bytes_since_flush += n;
                 if batch_start.is_none() && n > 0 { batch_start = Some(tokio::time::Instant::now()); }
                 if err { had_error = true; }
-                // Opportunistically drain a few more control commands.
+                // opportunistically drain a few more control commands.
                 if !had_error {
                     for _ in 0..OPPORTUNISTIC_CAP {
                         match control_rx.try_recv() {
@@ -311,13 +311,13 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                 }
             }
 
-            // Data channel: take one, then opportunistically grab a few more.
+            // data channel: take one, then opportunistically grab a few more.
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
                     tracing::debug!("SPDY writer: command channel closed");
                     break;
                 };
-                // Always drain pending controls first (priority).
+                // always drain pending controls first (priority).
                 while let Ok(c) = control_rx.try_recv() {
                     let (err, n) = process_writer_command(
                         c, &mut writer, &mut codec, &mut pending_closes, write_timeout,
@@ -337,7 +337,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                     if batch_start.is_none() && n > 0 { batch_start = Some(tokio::time::Instant::now()); }
                     if err { had_error = true; }
                 }
-                // Opportunistically drain a few more data commands.
+                // opportunistically drain a few more data commands.
                 if !had_error {
                     for _ in 0..OPPORTUNISTIC_CAP {
                         match cmd_rx.try_recv() {
@@ -373,7 +373,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                 }
             }
 
-            // Writer stall watchdog.
+            // writer stall watchdog.
             _ = stall_check.tick() => {
                 let stall_threshold = write_timeout.saturating_mul(2);
                 let queued = control_rx.len() + cmd_rx.len();
@@ -386,7 +386,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                     cancel.cancel();
                     break;
                 }
-                // Stall check doesn't write anything, skip flush.
+                // stall check doesn't write anything, skip flush.
                 continue;
             }
         }
@@ -395,7 +395,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
             break;
         }
 
-        // End-of-batch flush. Each select branch processes up to
+        // end-of-batch flush. Each select branch processes up to
         // WRITE_BATCH_CAP commands (1 from recv + OPPORTUNISTIC_CAP from
         // try_recv) before reaching here, coalescing up to 64 frames per
         // flush.
@@ -419,11 +419,11 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
             batch_start = None;
         }
 
-        // Drain deferred close notifications to the workers via close_reg
+        // drain deferred close notifications to the workers via close_reg
         // channels. This is an OPTIMIZATION; the correctness path is the
         // pre-reserved permits in StreamGuard::drop.
         //
-        // CRITICAL: use `try_send`, not `send().await`. If a worker's
+        // critical: use `try_send`, not `send().await`. If a worker's
         // close_reg_rx is momentarily full, blocking the writer here would
         // freeze the entire data plane. On `Full`, requeue so the next
         // cycle tries again. On `Closed`, the worker is gone.
@@ -437,7 +437,7 @@ pub(super) async fn run_writer<W: WsFrameWriter>(parts: WriterParts<W>, config: 
                     requeued.push(stream_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // Worker gone, session is dying.
+                    // worker gone, session is dying.
                     had_error = true;
                     break;
                 }
@@ -479,7 +479,7 @@ pub(super) async fn process_writer_command<W: WsFrameWriter>(
     // The "error stream half-closed at open" pattern (empty DATA+FIN
     // right after the SYN_STREAMs) is a common SPDY/3.1 idiom for
     // "I will never write on this stream, but I want to read from it".
-    // Setting fin=true on the SYN_STREAM itself is allowed by the spec
+    // setting fin=true on the SYN_STREAM itself is allowed by the spec
     // but some peers (notably Kubernetes kubelet) reject it; this
     // implementation always uses the explicit DATA+FIN form so it works
     // against the widest set of peers.
@@ -560,7 +560,7 @@ pub(super) async fn process_writer_command<W: WsFrameWriter>(
                 "SPDY writer: error-stream DATA+FIN timed out after {:?}"
             );
         }
-        // Emit the first DATA frame on the data stream. The send window
+        // emit the first DATA frame on the data stream. The send window
         // was debited at the lazy-open call site (see `Stream::poll_write`
         // unopened branch in `stream.rs`); we encode the frame as-is.
         if !first_payload.is_empty() {

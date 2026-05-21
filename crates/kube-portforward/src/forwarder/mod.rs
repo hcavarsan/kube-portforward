@@ -110,7 +110,7 @@ impl Forwarder {
             let session = self.ensure_session(target_port).await?;
             match session.connect().await {
                 Ok(s) => return Ok(s),
-                // Capacity exhaustion on this session means the pool is saturated;
+                // capacity exhaustion on this session means the pool is saturated;
                 // ensure_session() will pick a different one on the next iteration.
                 Err(Error::CapacityExhausted { .. }) => {}
                 Err(e) => return Err(e),
@@ -139,8 +139,8 @@ impl Forwarder {
         drain_and_cancel_all(&self.sessions).await;
         let mut set = self.background_tasks.lock().await;
         set.abort_all();
-        while let Some(result) = set.join_next().await {
-            match result {
+        while let Some(join_result) = set.join_next().await {
+            match join_result {
                 Err(e) if e.is_panic() => {
                     tracing::warn!("background task panicked during shutdown: {e}");
                 }

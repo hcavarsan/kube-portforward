@@ -33,15 +33,15 @@ struct HandleMetrics {
 impl HandleMetrics {
     const fn new() -> Self {
         Self {
-            // Seed with 1ms to avoid zero-cost bias before first measurement.
+            // seed with 1ms to avoid zero-cost bias before first measurement.
             rtt_ns: AtomicU64::new(1_000_000),
         }
     }
 
     /// Begin an RTT measurement. The returned guard records the sample
-    /// when its `complete()` method is called. If dropped without calling
-    /// `complete()`, no measurement is recorded. This is intentional
-    /// for early-return paths (closed handle, capacity exhausted).
+    /// when you call `complete()`. If dropped without calling `complete()`,
+    /// no measurement is recorded — that's intentional for early-return
+    /// paths (closed handle, capacity exhausted).
     fn start_sample(&self) -> RttSample<'_> {
         RttSample {
             metrics: self,
@@ -59,10 +59,10 @@ impl HandleMetrics {
         let mut prev = self.rtt_ns.load(Ordering::Relaxed);
         loop {
             let next = if elapsed_ns > prev {
-                // New peak: adopt immediately for fast spike adaptation.
+                // new peak: adopt immediately for fast spike adaptation.
                 elapsed_ns
             } else {
-                // Decay toward current measurement: new = prev*0.9 + elapsed*0.1
+                // decay toward current measurement: new = prev*0.9 + elapsed*0.1
                 (prev / 10) * 9 + elapsed_ns / 10
             };
             match self.rtt_ns.compare_exchange_weak(
@@ -94,7 +94,7 @@ struct RttSample<'a> {
 impl RttSample<'_> {
     fn complete(self) {
         let elapsed_ns = self.start.elapsed().as_nanos();
-        // Cap at u64::MAX (won't happen in practice but defensive).
+        // cap at u64::MAX (won't happen in practice but defensive).
         let elapsed_ns = u64::try_from(elapsed_ns).unwrap_or(u64::MAX);
         self.metrics.record_rtt(elapsed_ns);
     }
@@ -111,7 +111,7 @@ impl RttSample<'_> {
 /// # Transport break contract
 ///
 /// When a transport closes or errors, every stream on that handle
-/// receives `BrokenPipe`. The session does not reconnect. Layers above
+/// receives `BrokenPipe`. The session doesn't reconnect. Layers above
 /// (typically a forwarder) open a fresh session on transport failure.
 pub struct Session {
     pool: Vec<MuxHandle>,
@@ -164,7 +164,7 @@ impl Session {
             }
         }
         if pool.is_empty() {
-            // All connections failed: propagate the last error.
+            // all connections failed: propagate the last error.
             return Err(last_error.unwrap_or(Error::MuxClosed));
         }
         if pool.len() < total {
@@ -194,7 +194,7 @@ impl Session {
     ///
     /// `error_headers` and `data_headers` are passed verbatim to the codec
     /// as the SYN_STREAM header block for the respective stream. The
-    /// session does not interpret them.
+    /// session doesn't interpret them.
     pub async fn open_stream_pair(
         &self, error_headers: Vec<(String, String)>, data_headers: Vec<(String, String)>,
     ) -> Result<Stream, Error> {
@@ -217,7 +217,7 @@ impl Session {
             }
         }
 
-        for attempt in 0..pool_size {
+        for round in 0..pool_size {
             let idx = self.next.fetch_add(1, Ordering::Relaxed) % pool_size;
             if let Some(stream) = self
                 .try_open(idx, error_headers.clone(), data_headers.clone())
@@ -227,7 +227,7 @@ impl Session {
             }
             tracing::debug!(
                 handle = idx,
-                attempt,
+                round,
                 "SPDY session: handle unavailable, trying next"
             );
         }
@@ -238,7 +238,7 @@ impl Session {
         })
     }
 
-    /// Attempt to open a stream on the given handle index.
+    /// Try to open a stream on the given handle index.
     /// Returns Ok(Some(stream)) on success, Ok(None) if handle is closed or
     /// at capacity, Err on fatal errors.
     ///
@@ -267,7 +267,7 @@ impl Session {
                 Ok(Some(stream))
             }
             Err(Error::CapacityExhausted { .. }) => {
-                // Sample dropped without complete(): no spurious RTT record.
+                // sample dropped without complete(): no spurious RTT record.
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -287,7 +287,7 @@ impl Session {
     /// Pick two distinct random indices using xorshift on the atomic counter.
     /// Cheap and good enough for load balancing (no rand dependency needed).
     fn pick_two(&self, pool_size: usize) -> (usize, usize) {
-        // Use fetch_add as a cheap entropy source.
+        // use fetch_add as a cheap entropy source.
         let seed = self.next.fetch_add(1, Ordering::Relaxed) as u64;
         let a = (seed % pool_size as u64) as usize;
         // LCG multiplier from Knuth's MMIX (also used by PCG family).

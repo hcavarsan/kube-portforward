@@ -4,9 +4,6 @@
 //! resolves a [`PodSelector`] (label expression or pod name) to a currently
 //! ready pod. Lifecycle events are broadcast on a [`tokio::sync::broadcast`]
 //! channel as [`PodChange`].
-//!
-//! This module is intentionally kftray-agnostic — it knows nothing about
-//! services, workload types, or any higher-level configuration.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,14 +48,14 @@ pub enum PodSelector {
     Labels { selector: String },
 }
 
-/// Pod lifecycle change broadcast to subscribers.
+/// Pod lifecycle change sent to subscribers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PodChange {
     /// A pod matching the selector became ready (or replaced a previously
-    /// ready pod). Carries the new pod name.
+    /// ready pod). Has the new pod name.
     Ready(String),
-    /// The previously ready pod was deleted. Carries the dead pod name.
+    /// The previously ready pod was deleted. Has the dead pod name.
     Died(String),
 }
 
@@ -78,7 +75,7 @@ impl ReadyPod {
 }
 
 /// Watches pods in a namespace and tracks the currently ready pod matching
-/// a [`PodSelector`]. Owns a background reflector task that is aborted on
+/// a [`PodSelector`]. Owns a background reflector task that's aborted on
 /// [`PodWatcher::shutdown`].
 pub struct PodWatcher {
     store: Store<Pod>,
@@ -223,13 +220,13 @@ impl PodWatcher {
             if !is_pod_ready(&pod, &self.selector) {
                 continue;
             }
-            // If the cached pod is still ready, return it directly
+            // if the cached pod is still ready, return it directly
             if let Some(ref c) = cached {
                 if pod.name_any() == c.name {
                     return Some((**c).clone());
                 }
             }
-            // Track first ready pod as fallback
+            // track first ready pod as fallback
             if first_ready.is_none() {
                 first_ready = Some(ReadyPod {
                     name: pod.name_any(),
@@ -250,7 +247,7 @@ impl PodWatcher {
         }
     }
 
-    /// Wait until a ready pod is available or `timeout` elapses.
+    /// Wait until a ready pod shows up or `timeout` elapses.
     /// Wakes on `PodChange` events instead of polling.
     pub async fn wait_for_ready_pod(&self, timeout: Duration) -> Option<ReadyPod> {
         if let Some(pod) = self.ready_pod() {
@@ -280,8 +277,8 @@ impl PodWatcher {
         }
     }
 
-    /// Subscribe to pod lifecycle events. Each new subscriber sees only
-    /// events emitted after the subscription.
+    /// Subscribe to pod lifecycle events. Each new subscriber only sees
+    /// events sent after the subscription.
     pub fn subscribe(&self) -> broadcast::Receiver<PodChange> {
         self.change_tx.subscribe()
     }
@@ -302,7 +299,7 @@ fn update_latest(
 
     let name = pod.name_any();
 
-    // Check whether the pod actually changed before allocating
+    // check whether the pod actually changed before allocating
     let prev = latest.load();
     let changed = match prev.as_deref() {
         Some(cur) => cur.name != name,

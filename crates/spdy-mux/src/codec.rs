@@ -68,17 +68,17 @@ pub(crate) enum Frame {
     Unknown,
 }
 
-/// Stateful SPDY/3.1 codec handling zlib-compressed header blocks.
+/// Stateful SPDY/3.1 codec that handles zlib-compressed header blocks.
 ///
-/// The compressor and decompressor maintain state across frames (flushed,
-/// not reset between frames) per the SPDY specification.
+/// The compressor and decompressor keep state across frames (flushed, not
+/// reset between frames) per the SPDY spec.
 pub(crate) struct SpdyCodec {
     compressor: Compress,
     decompressor: Decompress,
     compress_buf: Vec<u8>,
     dict_set_compress: bool,
     dict_set_decompress: bool,
-    /// Maximum incoming frame payload size. Frames exceeding this are rejected.
+    /// Max incoming frame payload size. Frames bigger than this get rejected.
     max_frame_size: u32,
 }
 
@@ -94,23 +94,23 @@ impl SpdyCodec {
         }
     }
 
-    /// Update the max frame size (e.g. after receiving peer SETTINGS).
+    /// Updates the max frame size (e.g. after getting peer SETTINGS).
     pub(crate) const fn set_max_frame_size(&mut self, size: u32) {
         self.max_frame_size = size;
     }
 
-    /// Encode a SYN_STREAM control frame.
+    /// Encodes a SYN_STREAM control frame.
     ///
-    /// Priority field is set to 0 for all port-forward streams.
-    /// If heterogeneous priorities are needed in the future, the writer's
-    /// cmd_tx should be replaced with a priority queue.
+    /// Priority is set to 0 for all port-forward streams.
+    /// If you need different priorities later, swap the writer's
+    /// cmd_tx for a priority queue.
     pub(crate) fn encode_syn_stream(
         &mut self, stream_id: u32, headers: &[(String, String)], fin: bool,
     ) -> Result<Vec<u8>, Error> {
         self.encode_syn_stream_with_priority(stream_id, headers, fin, 0)
     }
 
-    /// Encode a SYN_STREAM control frame with configurable priority (0-7,
+    /// Encodes a SYN_STREAM control frame with configurable priority (0-7,
     /// lower = higher priority).
     pub(crate) fn encode_syn_stream_with_priority(
         &mut self, stream_id: u32, headers: &[(String, String)], fin: bool, priority: u8,
@@ -122,7 +122,7 @@ impl SpdyCodec {
         let payload_len = 10 + compressed_headers.len();
         let mut frame = Vec::with_capacity(8 + payload_len);
 
-        // Control frame header
+        // control frame header
         frame.extend_from_slice(&SPDY_VERSION.to_be_bytes());
         frame.extend_from_slice(&SYN_STREAM_TYPE.to_be_bytes());
         let flags_len = ((if fin { FLAG_FIN } else { 0 } as u32) << 24) | (payload_len as u32);
@@ -138,12 +138,12 @@ impl SpdyCodec {
         Ok(frame)
     }
 
-    /// Encode a DATA frame. Does NOT split; the caller must ensure the
-    /// payload fits within max_frame_size (see `split_data_frames`).
+    /// Encodes a DATA frame. Doesn't split; the caller must make sure the
+    /// payload fits in max_frame_size (see `split_data_frames`).
     pub(crate) fn encode_data(&self, stream_id: u32, payload: &[u8], fin: bool) -> Vec<u8> {
         let mut frame = Vec::with_capacity(8 + payload.len());
 
-        // Data frame: stream_id with MSB=0
+        // data frame: stream_id with MSB=0
         frame.extend_from_slice(&(stream_id & 0x7FFF_FFFF).to_be_bytes());
         let flags_len = ((if fin { FLAG_FIN } else { 0 } as u32) << 24) | (payload.len() as u32);
         frame.extend_from_slice(&flags_len.to_be_bytes());
@@ -152,7 +152,7 @@ impl SpdyCodec {
         frame
     }
 
-    /// Encode a RST_STREAM control frame.
+    /// Encodes a RST_STREAM control frame.
     pub(crate) fn encode_rst_stream(&self, stream_id: u32, status: u32) -> Vec<u8> {
         let mut frame = Vec::with_capacity(16);
 
@@ -166,7 +166,7 @@ impl SpdyCodec {
         frame
     }
 
-    /// Encode a PING frame.
+    /// Encodes a PING frame.
     pub(crate) fn encode_ping(&self, id: u32) -> Vec<u8> {
         let mut frame = Vec::with_capacity(12);
 
@@ -179,7 +179,7 @@ impl SpdyCodec {
         frame
     }
 
-    /// Encode a WINDOW_UPDATE control frame.
+    /// Encodes a WINDOW_UPDATE control frame.
     pub(crate) fn encode_window_update(&self, stream_id: u32, delta: u32) -> Vec<u8> {
         let mut frame = Vec::with_capacity(16);
 
@@ -193,7 +193,7 @@ impl SpdyCodec {
         frame
     }
 
-    /// Encode a GOAWAY control frame.
+    /// Encodes a GOAWAY control frame.
     pub(crate) fn encode_goaway(&self, last_good_stream_id: u32, status: u32) -> Vec<u8> {
         let mut frame = Vec::with_capacity(16);
 
@@ -207,7 +207,7 @@ impl SpdyCodec {
         frame
     }
 
-    /// Encode a SETTINGS control frame.
+    /// Encodes a SETTINGS control frame.
     ///
     /// SPDY/3.1 SETTINGS format:
     ///   4-byte entry count, then N entries of (flags:1 + id:3 + value:4) = 8
@@ -216,13 +216,13 @@ impl SpdyCodec {
         let payload_len = 4 + entries.len() * 8;
         let mut frame = Vec::with_capacity(8 + payload_len);
 
-        // Control frame header
+        // control frame header
         frame.extend_from_slice(&SPDY_VERSION.to_be_bytes());
         frame.extend_from_slice(&SETTINGS_TYPE.to_be_bytes());
         // flags=0, length=payload_len
         frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
 
-        // Entry count
+        // entry count
         frame.extend_from_slice(&(entries.len() as u32).to_be_bytes());
 
         for &(id, value) in entries {
@@ -236,17 +236,17 @@ impl SpdyCodec {
         frame
     }
 
-    /// Attempt to decode one SPDY frame from a `BytesMut` buffer.
+    /// Tries to decode one SPDY frame from a `BytesMut` buffer.
     ///
     /// For DATA frames the payload is split off zero-copy via
-    /// `BytesMut::split_to` + `freeze()`, avoiding allocation.
+    /// `BytesMut::split_to` + `freeze()`, so no extra allocation.
     ///
     /// Enforces `max_frame_size` on incoming payloads. Oversized frames
     /// return `Err(Error::FrameTooLarge { .. })`.
     ///
-    /// Returns `Ok(Some(frame))` when a complete frame is available (the
-    /// consumed bytes are removed from `buf`), `Ok(None)` when more data is
-    /// needed, or `Err` on a protocol error.
+    /// Returns `Ok(Some(frame))` when a complete frame is ready (consumed
+    /// bytes are removed from `buf`), `Ok(None)` when more data is needed,
+    /// or `Err` on a protocol error.
     pub(crate) fn decode_frame(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
         if buf.len() < 8 {
             return Ok(None);
@@ -259,8 +259,8 @@ impl SpdyCodec {
         let flags = (flags_len >> 24) as u8;
         let payload_len = (flags_len & 0x00FF_FFFF) as usize;
 
-        // Frame size enforcement for DATA frames (control frames are
-        // typically small and exempt from this check per SPDY spec).
+        // frame size check for DATA frames (control frames are usually
+        // small and exempt per SPDY spec).
         if !is_control && payload_len > self.max_frame_size as usize {
             let stream_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) & 0x7FFF_FFFF;
             return Err(Error::FrameTooLarge {
@@ -283,7 +283,7 @@ impl SpdyCodec {
         } else {
             let stream_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) & 0x7FFF_FFFF;
             let fin = (flags & FLAG_FIN) != 0;
-            // Split off the entire frame, then slice off the 8-byte header
+            // split off the entire frame, then slice off the 8-byte header
             // to get a zero-copy Bytes handle to the payload.
             let mut frame_bytes = buf.split_to(total);
             let payload = frame_bytes.split_off(8).freeze();
@@ -391,7 +391,7 @@ impl SpdyCodec {
                             SETTINGS_MAX_CONCURRENT_STREAMS => {
                                 max_concurrent_streams = Some(value);
                             }
-                            // Non-standard: some peers advertise max frame size as
+                            // non-standard: some peers advertise max frame size as
                             // setting id 5. SPDY/3.1 itself defines settings 1-4 and
                             // 7-8; id 5 is left for peer-specific extensions.
                             5 => {
@@ -424,12 +424,11 @@ impl SpdyCodec {
         }
     }
 
-    /// Compress a header block using the stateful zlib compressor with the
-    /// SPDY dictionary. Header names are lowercased to match the SPDY/3.1
-    /// spec; receivers reject frames whose header names contain uppercase
-    /// characters.
+    /// Compresses a header block using the stateful zlib compressor with the
+    /// SPDY dictionary. Header names get lowercased to match the SPDY/3.1
+    /// spec; receivers reject frames with uppercase header names.
     fn compress_headers(&mut self, headers: &[(String, String)]) -> Result<Vec<u8>, Error> {
-        // Build uncompressed header block (names MUST be lowercased)
+        // build uncompressed header block (names must be lowercased)
         let mut block = Vec::new();
         let num_headers = headers.len() as u32;
         block.extend_from_slice(&num_headers.to_be_bytes());
@@ -441,7 +440,7 @@ impl SpdyCodec {
             block.extend_from_slice(value.as_bytes());
         }
 
-        // Set dictionary on first use
+        // set dictionary on first use
         if !self.dict_set_compress {
             self.compressor
                 .set_dictionary(SPDY_DICT)
@@ -449,7 +448,7 @@ impl SpdyCodec {
             self.dict_set_compress = true;
         }
 
-        // Compress with SyncFlush (not full reset)
+        // compress with SyncFlush (not full reset)
         self.compress_buf.clear();
         self.compress_buf.resize(block.len() + 512, 0);
 
@@ -479,7 +478,7 @@ impl SpdyCodec {
                     if total_in >= block.len() && produced == 0 {
                         break;
                     }
-                    // Need more output space
+                    // need more output space
                     if total_out >= self.compress_buf.len().saturating_sub(64) {
                         self.compress_buf.resize(self.compress_buf.len() * 2, 0);
                     }
@@ -491,8 +490,8 @@ impl SpdyCodec {
         Ok(self.compress_buf[..total_out].to_vec())
     }
 
-    /// Decompress a header block using the stateful zlib decompressor with SPDY
-    /// dictionary.
+    /// Decompresses a header block using the stateful zlib decompressor with
+    /// SPDY dictionary.
     fn decompress_headers(&mut self, compressed: &[u8]) -> Result<Vec<(String, String)>, Error> {
         if compressed.is_empty() {
             return Ok(Vec::new());
@@ -500,7 +499,7 @@ impl SpdyCodec {
 
         let mut output = vec![0u8; compressed.len() * 4 + 1024];
 
-        // Track absolute positions via the decompressor's counters.
+        // track absolute positions via the decompressor's counters.
         let base_in = self.decompressor.total_in() as usize;
         let base_out = self.decompressor.total_out() as usize;
 
@@ -512,13 +511,13 @@ impl SpdyCodec {
                 output.resize(output.len() * 2, 0);
             }
 
-            let result = self.decompressor.decompress(
+            let decompress_status = self.decompressor.decompress(
                 &compressed[cur_in..],
                 &mut output[cur_out..],
                 FlushDecompress::Sync,
             );
 
-            match result {
+            match decompress_status {
                 Ok(status) => {
                     let new_in = self.decompressor.total_in() as usize - base_in;
                     let new_out = self.decompressor.total_out() as usize - base_out;
@@ -548,7 +547,7 @@ impl SpdyCodec {
                             .set_dictionary(SPDY_DICT)
                             .map_err(|e| Error::Compression(e.to_string()))?;
                         self.dict_set_decompress = true;
-                        // Continue the loop; retry decompression from where we
+                        // continue the loop; retry decompression from where we
                         // left off.
                     } else {
                         return Err(Error::Compression(e.to_string()));
@@ -559,51 +558,56 @@ impl SpdyCodec {
     }
 }
 
-/// Parse an uncompressed SPDY header block into name/value pairs.
-fn parse_header_block(data: &[u8]) -> Result<Vec<(String, String)>, Error> {
-    if data.len() < 4 {
+/// Parses an uncompressed SPDY header block into name/value pairs.
+fn parse_header_block(block_bytes: &[u8]) -> Result<Vec<(String, String)>, Error> {
+    if block_bytes.len() < 4 {
         return Err(Error::InvalidFrame("header block too short"));
     }
 
-    let num_headers = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let num_headers = u32::from_be_bytes([
+        block_bytes[0],
+        block_bytes[1],
+        block_bytes[2],
+        block_bytes[3],
+    ]) as usize;
     let mut headers = Vec::with_capacity(num_headers);
     let mut offset = 4;
 
     for _ in 0..num_headers {
-        if offset + 4 > data.len() {
+        if offset + 4 > block_bytes.len() {
             return Err(Error::InvalidFrame("header block truncated at name length"));
         }
         let name_len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
+            block_bytes[offset],
+            block_bytes[offset + 1],
+            block_bytes[offset + 2],
+            block_bytes[offset + 3],
         ]) as usize;
         offset += 4;
 
-        if offset + name_len > data.len() {
+        if offset + name_len > block_bytes.len() {
             return Err(Error::InvalidFrame("header block truncated at name"));
         }
-        let name = String::from_utf8_lossy(&data[offset..offset + name_len]).into_owned();
+        let name = String::from_utf8_lossy(&block_bytes[offset..offset + name_len]).into_owned();
         offset += name_len;
 
-        if offset + 4 > data.len() {
+        if offset + 4 > block_bytes.len() {
             return Err(Error::InvalidFrame(
                 "header block truncated at value length",
             ));
         }
         let value_len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
+            block_bytes[offset],
+            block_bytes[offset + 1],
+            block_bytes[offset + 2],
+            block_bytes[offset + 3],
         ]) as usize;
         offset += 4;
 
-        if offset + value_len > data.len() {
+        if offset + value_len > block_bytes.len() {
             return Err(Error::InvalidFrame("header block truncated at value"));
         }
-        let value = String::from_utf8_lossy(&data[offset..offset + value_len]).into_owned();
+        let value = String::from_utf8_lossy(&block_bytes[offset..offset + value_len]).into_owned();
         offset += value_len;
 
         headers.push((name, value));
@@ -620,7 +624,7 @@ mod tests {
         SpdyCodec::with_max_frame_size(16_384)
     }
 
-    /// Decode one complete frame; panic if the buffer is incomplete.
+    /// Decodes one complete frame; panics if the buffer is incomplete.
     fn decode_one(codec: &mut SpdyCodec, data: &[u8]) -> Frame {
         let mut buf = BytesMut::from(data);
         codec
@@ -802,11 +806,11 @@ mod tests {
     #[test]
     fn incomplete_buffer_returns_none() {
         let mut codec = fresh_codec();
-        // Less than 8 bytes, not enough for any frame header
+        // less than 8 bytes, not enough for any frame header
         let mut buf = BytesMut::from(&[0u8; 4][..]);
         assert!(codec.decode_frame(&mut buf).unwrap().is_none());
 
-        // Full header but truncated payload
+        // full header but truncated payload
         let encoded = codec.encode_data(1, b"hello", false);
         let mut buf = BytesMut::from(&encoded[..10]);
         assert!(codec.decode_frame(&mut buf).unwrap().is_none());
@@ -899,7 +903,7 @@ mod tests {
     #[test]
     fn frame_too_large_rejected() {
         let mut codec = SpdyCodec::with_max_frame_size(10);
-        // Encode a data frame with 20 bytes payload (exceeds max 10)
+        // encode a data frame with 20 bytes payload (exceeds max 10)
         let encoded = fresh_codec().encode_data(1, &[0u8; 20], false);
         let mut buf = BytesMut::from(&encoded[..]);
         match codec.decode_frame(&mut buf) {

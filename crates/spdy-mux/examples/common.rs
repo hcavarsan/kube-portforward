@@ -1,7 +1,3 @@
-//! Shared helpers: deploy/teardown a throwaway nginx pod, pretty-print
-//! HTTP upgrades, drive an HTTP request through a SPDY stream.
-//! Included via `#[path = "common.rs"] mod common;`.
-
 #![allow(dead_code, unreachable_pub)]
 
 use std::time::Duration;
@@ -39,7 +35,7 @@ use tokio::io::{
     AsyncWriteExt,
 };
 
-/// Create `namespace/name` running `nginx:alpine`, wait up to 90s for Ready.
+/// Creates nginx pod
 pub async fn ensure_nginx_pod(
     kube_client: &kube::Client, namespace: &str, name: &str,
 ) -> Result<String> {
@@ -77,11 +73,10 @@ pub async fn ensure_nginx_pod(
             Ok(name.to_string())
         }
         Ok(Err(e)) => bail!("waiting for pod ready: {e}"),
-        Err(_) => bail!("pod {namespace}/{name} did not become Ready within 90s"),
+        Err(_) => bail!("pod {namespace}/{name} didn't become Ready within 90s"),
     }
 }
 
-/// Best-effort delete. Errors logged, not propagated.
 pub async fn delete_pod(kube_client: &kube::Client, namespace: &str, name: &str) {
     let pods: Api<Pod> = Api::namespaced(kube_client.clone(), namespace);
     match pods.delete(name, &DeleteParams::default()).await {
@@ -90,8 +85,7 @@ pub async fn delete_pod(kube_client: &kube::Client, namespace: &str, name: &str)
     }
 }
 
-/// Send `req` via `kube::Client`, printing request + response in
-/// curl `-v` shape. Returns the response.
+/// Sends requests
 pub async fn send_with_trace(
     kube_client: &kube::Client, req: http::Request<Body>,
 ) -> Result<Response<Body>> {
@@ -117,9 +111,6 @@ fn print_response(status: StatusCode, headers: &HeaderMap) {
     println!("<");
 }
 
-/// Open a kubelet-shaped paired stream on `session` for `port` and run
-/// `GET /` against it. Prints the SPDY stream headers and the raw HTTP
-/// bytes flowing through.
 pub async fn nginx_get(session: &Session, port: u16) -> Result<()> {
     let port_s = port.to_string();
     let mk = |kind: &str| {
@@ -141,7 +132,9 @@ pub async fn nginx_get(session: &Session, port: u16) -> Result<()> {
         println!(">   {k}: {v}");
     }
 
-    let mut stream: Stream = session.open_stream_pair(error_headers, data_headers).await?;
+    let mut stream: Stream = session
+        .open_stream_pair(error_headers, data_headers)
+        .await?;
     println!("* paired stream open");
 
     let req = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
@@ -151,14 +144,14 @@ pub async fn nginx_get(session: &Session, port: u16) -> Result<()> {
     }
     println!(">");
 
-    // HTTP/1.0: read until the server half-closes for the full response.
-    let mut buf = Vec::with_capacity(8192);
-    stream.read_to_end(&mut buf).await?;
-    let head = String::from_utf8_lossy(&buf[..buf.len().min(400)]);
+    // read until the server half-closes to get the full response.
+    let mut response_body = Vec::with_capacity(8192);
+    stream.read_to_end(&mut response_body).await?;
+    let head = String::from_utf8_lossy(&response_body[..response_body.len().min(400)]);
     for line in head.lines() {
         println!("< {line}");
     }
-    println!("* read {} bytes from pod", buf.len());
+    println!("* read {} bytes from pod", response_body.len());
     Ok(())
 }
 

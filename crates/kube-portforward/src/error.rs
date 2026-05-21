@@ -18,10 +18,10 @@ pub enum Error {
     #[error("session capacity exhausted: {in_use}/{capacity} channel pairs in use")]
     CapacityExhausted { in_use: usize, capacity: usize },
 
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     Configuration(String),
 
-    #[error("Network error: {0}")]
+    #[error("network error: {0}")]
     Network(String),
 
     #[error(transparent)]

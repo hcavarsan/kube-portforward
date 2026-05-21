@@ -20,7 +20,7 @@ pub enum Error {
     #[error("SYN_REPLY timeout for stream {0}")]
     SynReplyTimeout(u32),
 
-    #[error("I/O error: {0}")]
+    #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("capacity exhausted: {in_use} active pairs, limit {limit}")]

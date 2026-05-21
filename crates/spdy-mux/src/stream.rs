@@ -91,11 +91,11 @@ enum StreamState {
         guard: StreamGuard,
     },
     /// Terminal state used while moving out of `Unopened` during realize.
-    /// Should never be observed by a user.
+    /// Shouldn't be seen by a user.
     Transitioning,
 }
 
-/// Boxed future driving a single lazy-open attempt.
+/// Boxed future driving a single lazy-open try.
 type LazyOpenFuture = Pin<Box<dyn Future<Output = Result<OpenedStreamParts, Error>> + Send>>;
 
 /// Guards the session's `active_pairs` counter for unopened streams.
@@ -150,11 +150,11 @@ const RST_STATUS_CANCEL: u32 = 5;
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        // GUARANTEED path: use pre-reserved permits for infallible delivery.
+        // guaranteed path: use pre-reserved permits for infallible delivery.
         // OwnedPermit::send() is synchronous, so no async is needed in Drop.
         let graceful = self.graceful_shutdown.load(Ordering::Acquire);
 
-        // The error stream is ALREADY half-closed at open time: the
+        // the error stream is already half-closed at open time: the
         // `OpenPortForwardAndWrite` writer command emitted an empty
         // DATA+FIN on `error_id` right after the two SYN_STREAM frames
         // (matching kubectl's `errorStream.Close()` behavior). Sending
@@ -162,7 +162,7 @@ impl Drop for StreamGuard {
         // for writes after open, and the peer interprets RST_STREAM as
         // an abnormal termination. Drop the permit unused.
         //
-        // Data stream: skip RST if poll_shutdown() already sent DATA+FIN
+        // data stream: skip RST if poll_shutdown() already sent DATA+FIN
         // (graceful half-close).
         let _ = self.ctrl_permit_error.take();
         if !graceful && let Some(permit) = self.ctrl_permit_data.take() {
@@ -172,7 +172,7 @@ impl Drop for StreamGuard {
             });
         }
 
-        // 2. Notify workers via close-reg channels (stream entry cleanup and
+        // 2. notify workers via close-reg channels (stream entry cleanup and
         //    send-window poisoning).
         if let Some(permit) = self.close_reg_permit_error.take() {
             permit.send(StreamRegistration::Close {
@@ -185,7 +185,7 @@ impl Drop for StreamGuard {
             });
         }
 
-        // 3. Release the session slot.
+        // 3. release the session slot.
         self.mux.release_pair();
     }
 }
@@ -250,7 +250,7 @@ impl Stream {
     /// to discard stale pre-opened streams.
     ///
     /// Unopened streams are never stale: no `SYN_STREAM` was sent yet, so
-    /// the apiserver has not created a backing pod TCP connection.
+    /// the apiserver hasn't created a backing pod TCP connection.
     pub fn is_read_closed(&self) -> bool {
         match &self.state {
             StreamState::Unopened {
@@ -367,7 +367,7 @@ fn poll_read_channel(
         return Poll::Ready(Ok(()));
     }
 
-    // Drain buffered data first
+    // drain buffered data first
     if let Some(ref mut remaining) = *read_buf {
         let to_copy = remaining.len().min(buf.remaining());
         buf.put_slice(&remaining[..to_copy]);
@@ -379,7 +379,7 @@ fn poll_read_channel(
         return Poll::Ready(Ok(()));
     }
 
-    // Poll channel for more data
+    // poll channel for more data
     match rx.poll_recv(cx) {
         Poll::Ready(Some(data)) => {
             let to_copy = data.len().min(buf.remaining());
@@ -453,7 +453,7 @@ fn broken_pipe() -> io::Error {
 /// Build a complete SPDY DATA frame in a single allocation and send it as a
 /// pre-encoded raw frame, enforcing per-stream send window flow control.
 ///
-/// Session-level send window is intentionally NOT enforced. The peer (kubelet
+/// Session-level send window isn't enforced on purpose. The peer (kubelet
 /// apiserver) never sends session-level WINDOW_UPDATE with stream_id=0, so
 /// enforcing it would deadlock once the initial window drains. Per-stream
 /// windows still provide proper backpressure.
@@ -472,19 +472,19 @@ fn poll_write_via_sender(
     write_tx: &mut PollSender<MuxCommand>, stream_id: u32, send_window: &SendWindow,
     max_frame_size: u32, cx: &mut Context<'_>, buf: &[u8],
 ) -> Poll<io::Result<usize>> {
-    // Early check: stream was closed (window poisoned by reader)
+    // early check: stream was closed (window poisoned by reader)
     if send_window.is_closed() {
         return Poll::Ready(Err(broken_pipe()));
     }
 
-    // Acquire cmd_tx permit. No side effects on Pending.
+    // acquire cmd_tx permit. No side effects on Pending.
     match write_tx.poll_reserve(cx) {
         Poll::Ready(Ok(())) => {}
         Poll::Ready(Err(_)) => return Poll::Ready(Err(broken_pipe())),
         Poll::Pending => return Poll::Pending,
     }
 
-    // Maximum DATA payload is max_frame_size - 8 (8-byte SPDY DATA header).
+    // maximum DATA payload is max_frame_size - 8 (8-byte SPDY DATA header).
     let max_payload = (max_frame_size as usize).saturating_sub(8);
     let max_payload = if max_payload == 0 {
         buf.len()
@@ -492,19 +492,19 @@ fn poll_write_via_sender(
         max_payload
     };
 
-    // Compute write size, clamped to per-stream window AND max_frame_size.
+    // compute write size, clamped to per-stream window AND max_frame_size.
     let stream_avail = send_window.available().max(0) as usize;
     let mut n = buf.len().min(stream_avail).min(max_payload);
 
     if n == 0 {
-        // Per-stream window exhausted. Register waker.
+        // per-stream window exhausted. Register waker.
         send_window.register_waker(cx.waker());
 
-        // Re-check for poisoning
+        // re-check for poisoning
         if send_window.is_closed() {
             return Poll::Ready(Err(broken_pipe()));
         }
-        // Re-check window after registering waker (lost wake guard)
+        // re-check window after registering waker (lost wake guard)
         let stream_avail = send_window.available().max(0) as usize;
         n = buf.len().min(stream_avail).min(max_payload);
         if n == 0 {
@@ -512,12 +512,12 @@ fn poll_write_via_sender(
         }
     }
 
-    // Debit per-stream window via CAS.
+    // debit per-stream window via CAS.
     if !send_window.consume(n) {
         return Poll::Ready(Err(broken_pipe()));
     }
 
-    // Build DATA frame and send via the reserved permit.
+    // build DATA frame and send via the reserved permit.
     let write_buf = &buf[..n];
     let mut frame = BytesMut::with_capacity(8 + n);
     frame.extend_from_slice(&(stream_id & 0x7FFF_FFFF).to_be_bytes());
@@ -555,11 +555,11 @@ struct LazyOpenArgs<'a> {
 /// Returns:
 /// - `Ready(Ok(n))` if open completed and `n` bytes were committed to the
 ///   atomic open+write batch (the bytes are owned by the writer now).
-/// - `Pending` if the realize future has not completed yet.
+/// - `Pending` if the realize future hasn't completed yet.
 /// - `Ready(Err(_))` on fatal mux error.
 ///
 /// The first payload is capped to one SPDY DATA frame (`max_frame_size - 8`)
-/// because `SpdyCodec::encode_data` does not split. Anything beyond that in
+/// because `SpdyCodec::encode_data` doesn't split. Anything beyond that in
 /// the caller's first `write_all()` lands in subsequent normal `poll_write`
 /// calls on the `Opened` state.
 fn poll_lazy_open(
@@ -575,8 +575,8 @@ fn poll_lazy_open(
         open_in_progress,
     } = args;
     if open_in_progress.is_none() {
-        // If pending senders have been consumed by a previous failed open
-        // attempt, the stream is permanently broken: nothing left to
+        // if pending senders have been consumed by a previous failed open
+        // try, the stream is permanently broken: nothing left to
         // register with the workers.
         let (Some(data_tx), Some(error_tx)) = (pending_data_tx.take(), pending_error_tx.take())
         else {
@@ -584,9 +584,9 @@ fn poll_lazy_open(
         };
         let max_payload = (max_frame_size as usize).saturating_sub(8).max(1);
         let n = buf.len().min(max_payload);
-        // Clone the first chunk so the future is cancellation-safe: if this
+        // clone the first chunk so the future is cancellation-safe: if this
         // poll returns Pending the next poll re-uses the same payload, and
-        // if the future is dropped the caller never observes the bytes as
+        // if the future is dropped the caller never sees the bytes as
         // committed.
         let first_payload = Bytes::copy_from_slice(&buf[..n]);
         let mux_clone = mux.clone();
@@ -679,15 +679,15 @@ impl AsyncWrite for Stream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // Empty writes are a no-op; never trigger lazy open.
+        // empty writes are a no-op; never trigger lazy open.
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        // Drive lazy open if needed. We borrow the Unopened state directly,
+        // drive lazy open if needed. We borrow the Unopened state directly,
         // then transition by replacing `state` with the new `Opened` value.
         if matches!(this.state, StreamState::Unopened { .. }) {
-            // Extract the fields we need to drive the future without moving
+            // extract the fields we need to drive the future without moving
             // the receivers (they stay borrowed by the state).
             let (parts, n_consumed) = match &mut this.state {
                 StreamState::Unopened {
@@ -719,7 +719,7 @@ impl AsyncWrite for Stream {
                 _ => unreachable!(),
             };
 
-            // Transition Unopened -> Opened, transferring ownership of the
+            // transition Unopened -> Opened, transferring ownership of the
             // active_pairs slot from the release guard into the StreamGuard.
             let old = std::mem::replace(&mut this.state, StreamState::Transitioning);
             let StreamState::Unopened {
@@ -764,7 +764,7 @@ impl AsyncWrite for Stream {
                 graceful_shutdown,
                 guard,
             };
-            // Drop the disarmed release guard explicitly.
+            // drop the disarmed release guard explicitly.
             drop(release_guard);
             return Poll::Ready(Ok(n_consumed));
         }
@@ -804,10 +804,6 @@ impl AsyncWrite for Stream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Split halves
-// ---------------------------------------------------------------------------
-
 /// State shared between `DataStream` and `ErrorStream` after `split()`.
 /// The data half drives lazy open; the error half participates via a single
 /// guard reference once the stream is realized.
@@ -815,7 +811,7 @@ enum SharedSplitState {
     Unopened(UnopenedShared),
     Opened(OpenedShared),
     /// Used while transferring fields out during the Unopened -> Opened
-    /// transition. Should never be observed by user code because the
+    /// transition. Shouldn't be seen by user code because the
     /// transition is performed under the parking_lot guard.
     Transitioning,
 }

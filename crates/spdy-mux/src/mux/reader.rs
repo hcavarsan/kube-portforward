@@ -105,10 +105,10 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
     let mut frame_buf = BytesMut::with_capacity(16 * 1024);
     let mut waiting_ping_ready = ping_ready;
 
-    // Session-level recv window tracking
+    // session-level recv window tracking
     let mut session_recv_consumed: u64 = 0;
 
-    // Idle timeout tracking
+    // idle timeout tracking
     let idle_timeout = config.idle_timeout;
     let ping_timeout = config.ping_timeout;
     let mut last_frame_time = tokio::time::Instant::now();
@@ -116,11 +116,11 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
     let mut idle_probe_sent_at: Option<tokio::time::Instant> = None;
 
     loop {
-        // Compute timeout for idle detection
+        // compute timeout for idle detection
         let time_since_last = last_frame_time.elapsed();
         let idle_remaining = idle_timeout.saturating_sub(time_since_last);
 
-        // Check ping timeout if we sent an idle probe
+        // check ping timeout if we sent an idle probe
         if let Some(sent_at) = idle_probe_sent_at {
             if sent_at.elapsed() >= ping_timeout {
                 tracing::warn!("SPDY reader: ping timeout after {ping_timeout:?}, tearing down");
@@ -136,7 +136,7 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
                 break;
             }
 
-            // Idle timeout fires: send a probe PING
+            // idle timeout fires: send a probe PING
             () = tokio::time::sleep(idle_remaining), if !idle_ping_sent && idle_probe_sent_at.is_none() => {
                 tracing::debug!("SPDY reader: idle timeout ({idle_timeout:?}), sending probe PING");
                 let _ = channels.control_tx.try_send(MuxCommand::EncodePing { id: 0xFFFF_FFFD });
@@ -146,17 +146,17 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
 
             msg = ws_read.read_message() => {
                 match msg {
-                    Some(Ok(WsMessage::Binary(data))) => {
-                        // Any frame received resets idle tracking
+                    Some(Ok(WsMessage::Binary(payload))) => {
+                        // any frame received resets idle tracking
                         last_frame_time = tokio::time::Instant::now();
                         idle_ping_sent = false;
                         idle_probe_sent_at = None;
 
                         tracing::trace!(
-                            len = data.len(),
+                            len = payload.len(),
                             "SPDY reader: received WS binary message"
                         );
-                        frame_buf.extend_from_slice(&data);
+                        frame_buf.extend_from_slice(&payload);
 
                         let mut should_break = false;
                         while frame_buf.len() >= 8 {
@@ -233,7 +233,7 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
     }
 
     shared.cancel.cancel();
-    // Workers handle their own cleanup (pending_replies + send_windows)
+    // workers handle their own cleanup (pending_replies + send_windows)
     // when their frame_rx / reg_rx channels close (triggered by cancel
     // or by this function dropping frame_txs).
 }
@@ -248,16 +248,16 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
             ref payload,
             ..
         } => {
-            // Session-level recv window tracking (reader-owned)
+            // session-level recv window tracking (reader-owned)
             if !payload.is_empty() {
                 let payload_len = payload.len() as u64;
                 *ctx.session_recv_consumed += payload_len;
                 if *ctx.session_recv_consumed >= (ctx.config.initial_window_size / 2) as u64 {
                     let delta = *ctx.session_recv_consumed as u32;
-                    // Only reset the counter on successful send. If the channel
+                    // only reset the counter on successful send. If the channel
                     // is full, the accumulated bytes carry over to the next DATA
                     // frame and we retry then. WINDOW_UPDATE deltas are additive,
-                    // so accumulating across attempts is safe. Resetting on
+                    // so accumulating across tries is safe. Resetting on
                     // failure causes the peer's view of our recv window to drift
                     // monotonically toward zero, the root cause of the 45s stall.
                     if ctx
@@ -299,10 +299,10 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
             delta_window_size,
         } => {
             if stream_id == 0 {
-                // Session-level WINDOW_UPDATE: handle inline
+                // session-level WINDOW_UPDATE: handle inline
                 ctx.shared.session_send_window.replenish(delta_window_size);
             } else {
-                // Per-stream WINDOW_UPDATE: route to worker
+                // per-stream WINDOW_UPDATE: route to worker
                 let worker = (stream_id % FRAME_WORKERS as u32) as usize;
                 if ctx.channels.frame_txs[worker]
                     .try_send(Frame::WindowUpdate {
@@ -324,7 +324,7 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
                 tracing::debug!(id, "SPDY reader: initial PING response received");
                 let _ = tx.send(Ok(()));
             } else if id % 2 == 0 {
-                // Server-initiated PING (even ID): respond via control channel.
+                // server-initiated PING (even ID): respond via control channel.
                 let _ = ctx
                     .channels
                     .control_tx
@@ -339,10 +339,10 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
         } => {
             tracing::warn!(last_good_stream_id, status, "SPDY GOAWAY received");
 
-            // Set flag to stop accepting new streams.
+            // set flag to stop accepting new streams.
             ctx.shared.goaway_received.store(true, Ordering::Release);
 
-            // Broadcast GoAway to all workers via close_reg channels
+            // broadcast GoAway to all workers via close_reg channels
             // (GoAway is a teardown event, not an open event).
             for close_reg_tx in ctx.channels.close_reg_txs.iter() {
                 let _ = close_reg_tx.try_send(StreamRegistration::GoAway {
@@ -356,7 +356,7 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
             headers,
             fin,
         } => {
-            // Server-initiated stream: port-forwarding doesn't accept these.
+            // server-initiated stream: port-forwarding doesn't accept these.
             tracing::debug!(
                 stream_id,
                 num_headers = headers.len(),
@@ -373,7 +373,7 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
             max_concurrent_streams,
             max_frame_size,
         } => {
-            // Honor INITIAL_WINDOW_SIZE: broadcast delta to all workers
+            // honor INITIAL_WINDOW_SIZE: broadcast delta to all workers
             if let Some(new_size) = initial_window_size {
                 let old_size = ctx
                     .shared
@@ -393,7 +393,7 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
                 }
             }
 
-            // Honor MAX_CONCURRENT_STREAMS
+            // honor MAX_CONCURRENT_STREAMS
             if let Some(max) = max_concurrent_streams {
                 tracing::debug!(
                     max_concurrent_streams = max,
@@ -402,7 +402,7 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
                 ctx.shared.peer_max_concurrent.store(max, Ordering::Release);
             }
 
-            // Honor MAX_FRAME_SIZE
+            // honor MAX_FRAME_SIZE
             if let Some(mfs) = max_frame_size {
                 tracing::debug!(
                     max_frame_size = mfs,

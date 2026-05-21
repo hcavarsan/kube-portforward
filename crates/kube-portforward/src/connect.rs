@@ -1,4 +1,4 @@
-//! HTTP upgrade mechanics for SPDY/3.1 port-forwarding.
+//! HTTP upgrade  for SPDY/3.1 port-forwarding.
 //!
 //! Provides two upgrade paths, both of which deliver SPDY/3.1 frames to the
 //! apiserver:
@@ -10,10 +10,8 @@
 //!   `kubectl port-forward` wire protocol. Works against older apiservers and
 //!   clusters with `PortForwardWebsockets` disabled.
 //!
-//! [`upgrade_spdy_with_fallback`] orchestrates kubectl-style fallback: it
+//! [`upgrade_spdy_with_fallback`] orchestrates fallback: it
 //! tries the WebSocket-tunnelled path first and, on a non-network failure
-//! (rejected upgrade or subprotocol mismatch), retries via the legacy
-//! path.
 
 use http::{
     Method,
@@ -36,11 +34,7 @@ const SPDY_SUBPROTOCOL: &str = "SPDY/3.1+portforward.k8s.io";
 const LEGACY_SPDY_UPGRADE: &str = "SPDY/3.1";
 const LEGACY_STREAM_PROTOCOL: &str = "portforward.k8s.io";
 
-/// One upgraded transport ready to carry SPDY/3.1 frames.
-///
-/// `protocol` records how the bytes are framed on the wire:
-/// [`Subprotocol::Spdy31Tunnel`] means WebSocket binary messages,
-/// [`Subprotocol::LegacySpdy`] means raw bytes (no framing).
+/// One upgraded transport ready to carry SPDY frames.
 pub(crate) struct SpdyUpgraded {
     pub upgraded: TokioIo<Upgraded>,
     pub protocol: Subprotocol,
@@ -56,15 +50,15 @@ fn name_is_valid(s: &str) -> bool {
 fn portforward_uri(cluster_url: &Uri, namespace: &str, pod: &str) -> Result<Uri, Error> {
     if !name_is_valid(namespace) || !name_is_valid(pod) {
         return Err(Error::Configuration(
-            "invalid namespace or pod name: contains forbidden character or non-ASCII".into(),
+            "invalid namespace or pod name: has a forbidden character or non-ASCII".into(),
         ));
     }
     let scheme = cluster_url
         .scheme()
-        .ok_or_else(|| Error::Configuration("cluster_url is missing scheme".into()))?;
+        .ok_or_else(|| Error::Configuration("cluster_url has no scheme".into()))?;
     let authority = cluster_url
         .authority()
-        .ok_or_else(|| Error::Configuration("cluster_url is missing authority".into()))?;
+        .ok_or_else(|| Error::Configuration("cluster_url has no authority".into()))?;
     let path = format!("/api/v1/namespaces/{namespace}/pods/{pod}/portforward");
     format!("{scheme}://{authority}{path}")
         .parse()
@@ -74,9 +68,6 @@ fn portforward_uri(cluster_url: &Uri, namespace: &str, pod: &str) -> Result<Uri,
 }
 
 /// Build a WebSocket-tunnelled SPDY upgrade request.
-///
-/// Port information is sent via SYN_STREAM headers inside the SPDY frames,
-/// so the URL carries no `?ports=` query string.
 fn build_spdy_tunnel_request(
     cluster_url: &Uri, namespace: &str, pod: &str,
 ) -> Result<Request<Vec<u8>>, Error> {
@@ -92,9 +83,6 @@ fn build_spdy_tunnel_request(
 }
 
 /// Build a raw SPDY/3.1 upgrade request (no WebSocket envelope).
-///
-/// Mirrors the legacy `kubectl port-forward` POST: `Upgrade: SPDY/3.1`
-/// plus `X-Stream-Protocol-Version: portforward.k8s.io`.
 fn build_legacy_spdy_request(
     cluster_url: &Uri, namespace: &str, pod: &str,
 ) -> Result<Request<Vec<u8>>, Error> {
@@ -111,8 +99,7 @@ fn build_legacy_spdy_request(
         })
 }
 
-/// Send a WebSocket upgrade request, validate the 101 + subprotocol echo,
-/// and return the raw upgraded connection.
+/// Send a WebSocket upgrade request, and return the raw upgraded connection.
 async fn perform_ws_upgrade(
     kube_client: &kube::Client, request: Request<Vec<u8>>,
 ) -> Result<TokioIo<Upgraded>, Error> {
@@ -153,7 +140,7 @@ async fn perform_ws_upgrade(
         return Err(Error::ProtocolViolation {
             context: "SPDY-over-WebSocket subprotocol negotiation",
             detail: format!(
-                "server negotiated unexpected subprotocol: {negotiated:?} (wanted {SPDY_SUBPROTOCOL:?})"
+                "server picked an unexpected subprotocol: {negotiated:?} (wanted {SPDY_SUBPROTOCOL:?})"
             ),
         });
     }
@@ -164,15 +151,15 @@ async fn perform_ws_upgrade(
     Ok(TokioIo::new(upgraded))
 }
 
-/// Generate a `Sec-WebSocket-Key` header value (16 random bytes, base64).
+/// Generate a `Sec-WebSocket-Key` header value .
 fn generate_ws_key() -> String {
     use base64::Engine;
     let bytes: [u8; 16] = rand::random();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Send a raw HTTP/1.1 upgrade request to `SPDY/3.1`, validate the 101 +
-/// stream-protocol echo, and return the raw upgraded connection.
+/// Send a raw  upgrade request to `SPDY/3.1` and return the raw upgraded
+/// connection.
 async fn perform_legacy_spdy_upgrade(
     kube_client: &kube::Client, request: Request<Vec<u8>>,
 ) -> Result<TokioIo<Upgraded>, Error> {
@@ -199,7 +186,7 @@ async fn perform_legacy_spdy_upgrade(
         return Err(Error::ProtocolViolation {
             context: "legacy SPDY upgrade",
             detail: format!(
-                "server echoed unexpected Upgrade header: {upgrade_hdr:?} (wanted {LEGACY_SPDY_UPGRADE:?})"
+                "server sent back an unexpected Upgrade header: {upgrade_hdr:?} (wanted {LEGACY_SPDY_UPGRADE:?})"
             ),
         });
     }
@@ -212,7 +199,7 @@ async fn perform_legacy_spdy_upgrade(
         return Err(Error::ProtocolViolation {
             context: "legacy SPDY upgrade",
             detail: format!(
-                "server echoed unexpected X-Stream-Protocol-Version: {stream_protocol:?} \
+                "server sent back an unexpected X-Stream-Protocol-Version: {stream_protocol:?} \
                  (wanted {LEGACY_STREAM_PROTOCOL:?})"
             ),
         });
@@ -224,7 +211,7 @@ async fn perform_legacy_spdy_upgrade(
     Ok(TokioIo::new(upgraded))
 }
 
-/// Try a SPDY-over-WebSocket upgrade.
+/// Try a SPDY over WebSocket upgrade.
 pub(crate) async fn upgrade_spdy_tunnel(
     kube_client: &kube::Client, cluster_url: &Uri, namespace: &str, pod: &str,
 ) -> Result<SpdyUpgraded, Error> {
@@ -247,7 +234,7 @@ pub(crate) async fn upgrade_spdy_tunnel(
     })
 }
 
-/// Try a legacy raw-SPDY upgrade (no WebSocket framing).
+/// Try a legacy SPDY upgrade, without websocket.
 pub(crate) async fn upgrade_legacy_spdy(
     kube_client: &kube::Client, cluster_url: &Uri, namespace: &str, pod: &str,
 ) -> Result<SpdyUpgraded, Error> {
@@ -270,11 +257,7 @@ pub(crate) async fn upgrade_legacy_spdy(
     })
 }
 
-/// Whether a failed primary attempt should trigger the legacy fallback.
-///
-/// Fallback fires on apiserver-rejected upgrades (4xx / 5xx) and on
-/// subprotocol-echo mismatches. Real transport failures (Kube/Network/Io)
-/// propagate so callers see the actual reason.
+/// Whether a failed first try should trigger the legacy fallback.
 const fn should_fallback(err: &Error) -> bool {
     matches!(
         err,
@@ -284,11 +267,6 @@ const fn should_fallback(err: &Error) -> bool {
 
 /// Try the WebSocket-tunnelled SPDY path; on a rejected upgrade or
 /// subprotocol mismatch, fall back to raw SPDY/3.1.
-///
-/// Mirrors kubectl's `FallbackDialer`. `recovery_callback` is invoked with
-/// [`RecoverySignal::UpgradeFailed`] when the primary attempt fails so the
-/// caller can observe negotiation regressions even when the fallback
-/// succeeds.
 pub(crate) async fn upgrade_spdy_with_fallback(
     kube_client: &kube::Client, cluster_url: &Uri, namespace: &str, pod: &str,
     recovery_callback: &RecoveryCallback,

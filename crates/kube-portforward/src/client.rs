@@ -17,11 +17,10 @@ const DEFAULT_PING: Duration = Duration::from_secs(15);
 const DEFAULT_WATCHDOG: Duration = Duration::from_secs(30);
 const DEFAULT_DRAIN: Duration = Duration::from_secs(2);
 
-/// Pool size for the SPDY multiplexer. Six parallel upgrades give each
-/// connection ~8 concurrent streams at the default operating cap of 64.
+/// Pool size for the  multiplexer
 const DEFAULT_SPDY_POOL_SIZE: usize = 6;
 
-/// Top-level entry point bundling a `kube::Client` with its cluster URL.
+/// entry point that bundles a `kube::Client` with its cluster URL.
 #[derive(Clone)]
 pub struct Client {
     kube: kube::Client,
@@ -94,17 +93,17 @@ impl ClientBuilder {
     }
 }
 
-/// Builder for opening a [`Session`].
+/// Builder for opening a session
 pub struct SessionBuilder<'c> {
     client: &'c Client,
     namespace: String,
     pod: String,
     port: u16,
-    #[allow(dead_code)] // accepted for API stability; spdy-mux owns its own keepalive schedule
+    #[allow(dead_code)] // spdy-mux owns its own keepalive schedule
     ping_interval: Duration,
-    #[allow(dead_code)] // accepted for API stability; spdy-mux owns its own watchdog
+    #[allow(dead_code)] // spdy-mux owns its own watchdog
     watchdog_timeout: Duration,
-    #[allow(dead_code)] // accepted for API stability; spdy-mux drains on cancel
+    #[allow(dead_code)] // spdy-mux drains on cancel
     drain_timeout: Duration,
     cancel: Option<CancellationToken>,
     recovery_callback: Option<RecoveryCallback>,
@@ -112,13 +111,12 @@ pub struct SessionBuilder<'c> {
 }
 
 impl SessionBuilder<'_> {
-    /// Accepted for API stability; SPDY multiplexing has no notion of a
-    /// pre-allocated channel pair pool.
+    /// SPDY multiplexing doesn't have a pre-allocated channel pair pool.
     pub const fn capacity(self, _n: usize) -> Self {
         self
     }
 
-    /// Accepted for API stability. The SPDY multiplexer manages its own
+    /// Accepted for API stability. The  multiplexer handles its own
     /// keepalive schedule based on idle time.
     pub const fn keepalive(mut self, ping: Duration, watchdog: Duration) -> Self {
         self.ping_interval = ping;
@@ -136,9 +134,8 @@ impl SessionBuilder<'_> {
         self
     }
 
-    /// Number of parallel upgraded connections in the SPDY pool. Each gets
-    /// its own reader/writer task pair; streams are distributed across the
-    /// pool by power-of-two-choices.
+    /// Number of parallel upgraded connections in the SPDY pool. Each one
+    /// gets its own reader/writer task pair
     pub fn spdy_pool_size(mut self, n: usize) -> Self {
         self.spdy_pool_size = n.max(1);
         self
@@ -171,11 +168,8 @@ impl SessionBuilder<'_> {
     }
 }
 
-/// Open a SPDY session: probe with the first upgrade, then fill the rest
-/// of the pool in parallel using the same transport the probe negotiated.
-///
-/// Pool members that fail their parallel upgrade are dropped; the session
-/// proceeds with whichever slots succeeded.
+/// Open a SPDY session, probe with the first upgrade, then fill the rest
+/// of the pool in parallel using whatever transport the probe picked.
 async fn open_spdy_session(
     client: &Client, namespace: &str, pod: &str, port: u16, pool_size: usize,
     cancel: CancellationToken, recovery_callback: RecoveryCallback,
@@ -198,9 +192,6 @@ async fn open_spdy_session(
         "SPDY tunnel: probe succeeded"
     );
 
-    // Parallel pool openings reuse the path the probe chose so the mux
-    // sees a homogeneous transport. Failed slots are dropped silently;
-    // the session continues with whichever connections came up.
     let extra_upgrades = if pool_size > 1 {
         let t_parallel = std::time::Instant::now();
         let mut join_set = tokio::task::JoinSet::new();

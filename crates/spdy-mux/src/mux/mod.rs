@@ -32,19 +32,19 @@
 //! poisoned via the cancellation token. A panic kills the session
 //! permanently. Restart at the Forwarder layer.
 
-// Private modules
+// private modules
 mod config;
 mod handle;
 mod supervisor;
 
-// Crate-internal modules
+// crate-internal modules
 mod commands;
 mod reader;
 mod window;
 mod worker;
 mod writer;
 
-// Task scheduling constants
+// task scheduling constants
 
 /// Number of frame worker tasks per WebSocket connection. Five workers
 /// balance contention against memory: each owns a disjoint shard of streams,
@@ -80,7 +80,7 @@ pub(super) const GOAWAY_STATUS_OK: u32 = 0;
 /// Maximum valid SPDY stream ID (31-bit unsigned).
 pub(super) const MAX_STREAM_ID: u32 = 0x7FFF_FFFF;
 
-// Re-exports
+// re-exports
 pub(crate) use commands::{
     MuxCommand,
     StreamRegistration,

@@ -1,8 +1,8 @@
 //! `spdy-mux` over the legacy `Upgrade: SPDY/3.1` HTTP/1.1 path.
 //!
-//! Self-contained: deploys an `nginx:alpine` pod, performs the upgrade
-//! via `kube::Client`, multiplexes a `GET /` through a kubelet-shaped
-//! stream pair, deletes the pod.
+//! spins up an nginx pod, does the upgrade
+//! via `kube::Client` and multiplexes a `GET /` through a
+//! stream pair, then deletes the pod.
 //!
 //! Run:
 //! ```text

@@ -42,7 +42,6 @@ impl Forwarder {
     }
 }
 
-/// Builder for [`Forwarder`].
 pub struct ForwarderBuilder {
     kube_client: kube::Client,
     cluster_url: http::Uri,

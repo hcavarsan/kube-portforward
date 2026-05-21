@@ -17,7 +17,7 @@ impl Forwarder {
     pub(super) async fn maybe_prefetch(
         &self, session: &Arc<Session>, target_port: u16, pod_name: String, pod_uid: String,
     ) {
-        // Replenish spare streams if below low watermark (non-blocking best-effort).
+        // replenish spare streams if below low watermark (non-blocking best-effort).
         // `replenish_spare_streams` internally guards against concurrent runs
         // via a CAS, so spawning multiple tasks is safe but wasteful.
         if session.needs_replenish() && !session.is_full() {
@@ -27,7 +27,7 @@ impl Forwarder {
             });
         }
 
-        // Use operating capacity (scheduling cap) for prefetch threshold,
+        // use operating capacity (scheduling cap) for prefetch threshold,
         // not the hard cap. At pool=6 × operating_max=64 this triggers
         // at ~230 active pairs (0.60 × 384).
         let capacity = session.operating_capacity();
@@ -65,7 +65,7 @@ impl Forwarder {
         self.background_tasks.lock().await.spawn(async move {
             debug!("forwarder: prefetching session for pod {}", pod_name);
             let cb = Arc::clone(&recovery_cb);
-            let result = pf_client
+            let open_result = pf_client
                 .session(&*namespace, &pod_name, target_port)
                 .capacity(config.session_capacity)
                 .keepalive(config.ping_interval, config.watchdog_timeout)
@@ -77,7 +77,7 @@ impl Forwarder {
 
             let mut pool = sessions.write().await;
             pool.prefetch_in_flight = false;
-            match result {
+            match open_result {
                 Ok(new) => {
                     let ok = pool.entries.len() < config.max_sessions
                         && pool.target_pod_uid.as_deref() == Some(pod_uid.as_str());
@@ -120,9 +120,8 @@ impl Forwarder {
     }
 }
 
-/// Snapshot session handles + metadata under write guard, drop it, then
-/// check `in_use()` on each outside the lock. Re-acquire to remove idle
-/// entries.
+/// Snapshot session handles and metadata under write guard, drop it, then
+/// check `in_use()` on each outside the lock.
 async fn prune_once(sessions: &Arc<TokioRwLock<SessionPool>>, idle_age: Duration) {
     let snapshots: Vec<(Arc<Session>, Instant, bool)> = {
         let pool = sessions.read().await;
@@ -160,7 +159,7 @@ async fn prune_once(sessions: &Arc<TokioRwLock<SessionPool>>, idle_age: Duration
     }
 
     let mut pool = sessions.write().await;
-    // Re-check: pool may have changed while we were checking in_use()
+    // pool may have changed while we were checking in_use()
     if pool.entries.len() != total {
         return;
     }

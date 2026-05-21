@@ -1,12 +1,11 @@
-//! `spdy-mux` over the modern WebSocket-tunnelled SPDY path
-//! (KEP-4006, `SPDY/3.1+portforward.k8s.io` subprotocol).
+//! SPDY over WebSocket path
 //!
-//! Self-contained: deploys an `nginx:alpine` pod, performs the
-//! WebSocket upgrade via `kube::Client`, multiplexes a `GET /` through
-//! a kubelet-shaped stream pair, deletes the pod.
+//! spins up an nginx pod, does the
+//! WebSocket upgrade via `kube::Client` and multiplexes a `GET /` through
+//! an stream pair, then deletes the pod.
 //!
-//! Requires a Kubernetes 1.31+ apiserver with `PortForwardWebsockets`
-//! enabled (default since 1.31).
+//! Needs a Kubernetes 1.31+ apiserver with `PortForwardWebsockets`
+//! enabled
 //!
 //! Run:
 //! ```text
@@ -106,7 +105,7 @@ async fn run(kube_client: &kube::Client, cluster_url: &http::Uri) -> anyhow::Res
     Ok(())
 }
 
-/// `Sec-WebSocket-Key`: 16 random bytes, base64-encoded.
+/// `Sec-WebSocket-Key`: 16 random bytes
 fn ws_key() -> String {
     let bytes: [u8; 16] = rand::random();
     base64::engine::general_purpose::STANDARD.encode(bytes)

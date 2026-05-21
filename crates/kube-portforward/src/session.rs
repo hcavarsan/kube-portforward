@@ -11,21 +11,20 @@ use crate::error::Error;
 use crate::stream::Stream;
 use crate::subprotocol::Subprotocol;
 
-/// Maximum number of pre-opened spare streams per session.
 const SPARE_STREAM_CAP: usize = 16;
 
 /// When spare count drops to or below this threshold, the background
-/// replenisher refills up to `SPARE_STREAM_CAP`.
+/// replenisher refills
 const SPARE_STREAM_LOW_WATERMARK: usize = 8;
 
-/// One header name and value pair as carried on a SPDY SYN_STREAM frame.
+/// One header  carried on a SPDY SYN_STREAM frame.
 type SpdyHeader = (String, String);
 
-/// The error-stream and data-stream header lists for one paired
+/// The error stream and data stream header lists for one paired
 /// `portforward.k8s.io` connection.
 type PortforwardHeaderPair = (Vec<SpdyHeader>, Vec<SpdyHeader>);
 
-/// One SPDY-tunnelled port-forward session that multiplexes many concurrent
+/// One port forward session that multiplexes many concurrent
 /// local connections over a pool of upgraded connections to the apiserver.
 pub struct Session {
     inner: spdy_mux::Session,
@@ -33,7 +32,7 @@ pub struct Session {
     /// Target pod port. The kubelet expects this in the SYN_STREAM
     /// `port` header for every paired stream we open.
     port: u16,
-    /// Monotonic request-id counter. The kubelet uses this header to
+    /// request id counter, kubelet uses this header to
     /// pair the data and error streams of one logical TCP connection.
     next_request_id: AtomicU32,
     /// Pre-opened spare streams for instant connect(). Background task
@@ -56,9 +55,8 @@ impl Session {
         }
     }
 
-    /// Build the K8s `portforward.k8s.io v1` SYN_STREAM headers for one
-    /// stream-pair connection. Header names are lowercase to match
-    /// `kubectl client-go`'s wire format.
+    /// Build the K8s `portforward.k8s.io v1`  headers for one
+    /// stream-pair connection, header names are lowercase
     fn portforward_headers(&self) -> PortforwardHeaderPair {
         let request_id = self
             .next_request_id
@@ -78,11 +76,7 @@ impl Session {
         (error_headers, data_headers)
     }
 
-    /// Allocate the next stream and return a bidirectional [`Stream`].
-    ///
-    /// Fast path: pops pre-opened spare streams (lock-free), discarding any
-    /// that the remote has already closed (FIN/RST while idle). Falls back
-    /// to opening a new stream if no usable spare is available.
+    /// Grab the next stream and return a bidirectional [`Stream`].
     pub async fn connect(&self) -> Result<Stream, Error> {
         while let Some(stream) = self.spare_streams.pop() {
             if !stream.is_read_closed() {
@@ -102,7 +96,7 @@ impl Session {
             .map_err(Error::from)
     }
 
-    /// Pre-open spare streams up to `SPARE_STREAM_CAP`.
+    /// Pre open spare streams up to `SPARE_STREAM_CAP`.
     pub async fn replenish_spare_streams(&self) {
         if self
             .replenishing
@@ -140,12 +134,11 @@ impl Session {
         self.protocol
     }
 
-    /// Maximum number of concurrent streams this session can hold (hard cap).
+    /// Max concurrent streams this session can hold.
     pub fn capacity(&self) -> usize {
         self.inner.capacity()
     }
 
-    /// Operating capacity: the scheduling cap below the hard cap.
     pub fn operating_capacity(&self) -> usize {
         self.inner.operating_capacity()
     }
@@ -176,7 +169,7 @@ impl Session {
     }
 }
 
-/// RAII guard that clears the `replenishing` flag on drop.
+/// guard that clears the `replenishing` flag on drop.
 struct ReplenishGuard<'a>(&'a AtomicBool);
 
 impl Drop for ReplenishGuard<'_> {

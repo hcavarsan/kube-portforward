@@ -14,11 +14,11 @@ use tokio::io::{
     ReadBuf,
 };
 
-/// Bidirectional port-forward stream backed by one SPDY/3.1 stream pair on
+/// port forward stream backed by one stream pair on
 /// a multiplexed connection to the apiserver. Implements
 /// `AsyncRead + AsyncWrite` on the data half. Dropping the `Stream` (or
 /// calling `poll_shutdown`) sends a SPDY FIN frame so the apiserver tears
-/// down the backing pod connection promptly.
+/// down the backing pod connection right away.
 pub struct Stream {
     inner: Box<spdy_mux::Stream>,
 }
@@ -30,9 +30,8 @@ impl Stream {
         }
     }
 
-    /// Returns true if the remote has already closed this stream's read
-    /// side. Used by spare-stream checkout to discard stale pre-opened
-    /// streams before handing them to the relay.
+    /// Returns true if the remote already closed this stream's read
+    /// side.
     pub fn is_read_closed(&self) -> bool {
         self.inner.is_read_closed()
     }

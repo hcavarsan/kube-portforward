@@ -28,7 +28,7 @@ impl SendWindow {
 
     /// Consume `n` bytes from the window, returning `true` on success.
     ///
-    /// Returns `false` if the window was poisoned (stream closed) between
+    /// Returns `false` if the window got poisoned (stream closed) between
     /// the caller's `is_closed()` check and this call.
     pub(crate) fn consume(&self, n: usize) -> bool {
         let n = n as i64;

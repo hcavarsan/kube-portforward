@@ -134,12 +134,12 @@ impl MuxHandle {
         let peer_initial_window = Arc::new(AtomicU32::new(config.initial_window_size));
         let peer_max_concurrent = Arc::new(AtomicU32::new(0)); // 0 = unlimited
         let goaway_received = Arc::new(AtomicBool::new(false));
-        // Session send window is kept for the reader (it replenishes when the
+        // session send window is kept for the reader (it replenishes when the
         // peer sends session-level WINDOW_UPDATE with stream_id=0).
         // poll_write_via_sender does NOT enforce it for outbound writes: the
         // kubelet apiserver peer never sends session-level WINDOW_UPDATE, so
         // enforcing it would deadlock once the initial window drains.
-        // Per-stream windows still provide backpressure.
+        // per-stream windows still provide backpressure.
         let session_send_window = Arc::new(SendWindow::new(config.initial_window_size));
         let max_frame_size = Arc::new(AtomicU32::new(config.max_frame_size));
         let closed = cancel.clone();
@@ -281,7 +281,7 @@ impl MuxHandle {
             supervise(writer_handle, reader_handle, worker_handles, s_cancel).await;
         });
 
-        // Wait for initial PING roundtrip.
+        // wait for initial PING roundtrip.
         match tokio::time::timeout(config.ping_timeout, ping_rx).await {
             Ok(Ok(Ok(()))) => {
                 tracing::debug!("SPDY mux: initial PING succeeded, connection ready");
@@ -345,8 +345,8 @@ impl MuxHandle {
             return Err(Error::MuxClosed);
         }
 
-        // Reserve capacity: check operating cap first, then hard cap.
-        // Atomic CAS handles concurrent reservations without a mutex.
+        // reserve capacity: check operating cap first, then hard cap.
+        // atomic CAS handles concurrent reservations without a mutex.
         let prev = self.active_pairs.fetch_add(1, Ordering::AcqRel);
         let operating_limit = self.operating_limit();
         if (prev as u32) >= operating_limit {
@@ -365,7 +365,7 @@ impl MuxHandle {
             });
         }
 
-        // Pre-create the per-stream channels. The senders are stashed in
+        // pre-create the per-stream channels. The senders are stashed in
         // the Stream and handed to the workers at realize time so any
         // pre-arrival DATA / FIN / RST frames addressed to this stream
         // (after `realize_portforward_pair` registers it) reach the
@@ -387,7 +387,7 @@ impl MuxHandle {
         }))
     }
 
-    /// Realize a lazily-opened stream pair on the wire.
+    /// Realize a lazily opened stream pair on the wire.
     ///
     /// Called from `Stream::poll_write` on the first non-empty write.
     /// Allocates stream IDs, registers both streams with their workers,
@@ -422,14 +422,14 @@ impl MuxHandle {
             return Err(Error::MuxClosed);
         }
 
-        // Acquire sequencer for the duration of:
+        // acquire sequencer for the duration of:
         //   - stream ID allocation
         //   - worker registration (2× reg_tx.try_send)
         //   - writer enqueue (cmd_tx.try_send(OpenPortForwardAndWrite))
         //   - permit reservation (4× try_reserve_owned)
         let mut seq = self.open_seq.lock().await;
 
-        // Re-check after acquiring (peer could have sent GOAWAY meanwhile).
+        // re-check after acquiring (peer could have sent GOAWAY meanwhile).
         if self.closed.is_cancelled() {
             return Err(Error::MuxClosed);
         }
@@ -437,13 +437,13 @@ impl MuxHandle {
             return Err(Error::MuxClosed);
         }
 
-        // Allocate IDs. SPDY/3.1 requires client streams to use odd IDs;
+        // allocate IDs. SPDY/3.1 requires client streams to use odd IDs;
         // the sequencer burns two per allocation, so a pair advances by 4.
         let error_id = seq.next_stream_id;
         let data_id = seq.next_stream_id.wrapping_add(2);
-        // Detect ID space exhaustion BEFORE advancing.
+        // detect ID space exhaustion BEFORE advancing.
         if data_id > MAX_STREAM_ID || error_id > MAX_STREAM_ID {
-            // Send GOAWAY through control channel (fire-and-forget).
+            // send GOAWAY through control channel (fire-and-forget).
             let _ = self.control_tx.try_send(MuxCommand::GoAway {
                 last_good_stream_id: error_id.wrapping_sub(2),
             });
@@ -460,12 +460,12 @@ impl MuxHandle {
         ));
         let (data_reply_tx, _data_reply_rx) = oneshot::channel();
 
-        // All sends below use `try_send`, not `send().await`, while
+        // all sends below use `try_send`, not `send().await`, while
         // holding `open_seq`. See the rationale in the original
         // `open_stream_pair` body: awaiting a bounded-channel send
         // under the mutex is a deadlock vector.
 
-        // Register error stream with its partition's worker.
+        // register error stream with its partition's worker.
         match self
             .reg_tx_for(error_id)
             .try_send(StreamRegistration::Open {
@@ -486,7 +486,7 @@ impl MuxHandle {
             }
         }
 
-        // Register data stream with its (possibly different) worker.
+        // register data stream with its (possibly different) worker.
         match self.reg_tx_for(data_id).try_send(StreamRegistration::Open {
             stream_id: data_id,
             data_tx: pending_data_tx,
@@ -511,12 +511,12 @@ impl MuxHandle {
             }
         }
 
-        // Eagerly debit the data send window for first_payload. The wire
+        // eagerly debit the data send window for first_payload. The wire
         // command we're about to enqueue will emit the payload as part of
         // the atomic open+write batch, so flow-control accounting must
         // happen here, not in the writer.
         if !first_payload.is_empty() && !data_send_window.consume(first_payload.len()) {
-            // Should never happen on a freshly-created window with the
+            // should never happen on a freshly-created window with the
             // peer's initial window size, but the API allows poisoning.
             let _ = self
                 .close_reg_tx_for(error_id)
@@ -529,7 +529,7 @@ impl MuxHandle {
             return Err(Error::MuxClosed);
         }
 
-        // Enqueue the atomic open+first-write command.
+        // enqueue the atomic open+first-write command.
         match self.cmd_tx.try_send(MuxCommand::OpenStreamPairAndWrite {
             error_id,
             data_id,
@@ -539,7 +539,7 @@ impl MuxHandle {
         }) {
             Ok(()) => {}
             Err(e) => {
-                // Best-effort cleanup: tell workers to forget both streams.
+                // best-effort cleanup: tell workers to forget both streams.
                 let _ = self
                     .close_reg_tx_for(error_id)
                     .try_send(StreamRegistration::Close {
@@ -558,7 +558,7 @@ impl MuxHandle {
             }
         }
 
-        // Pre-reserve 2 control-channel permits and 2 close-reg permits so
+        // pre-reserve 2 control-channel permits and 2 close-reg permits so
         // `StreamGuard::drop` can deliver `CloseStream` and worker-close
         // notifications synchronously via `OwnedPermit::send`. On failure
         // we must best-effort unregister both streams from their workers,

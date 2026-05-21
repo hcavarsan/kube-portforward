@@ -1,11 +1,9 @@
-//! End-to-end demo of `kube-portforward`, including the reliability story.
-//!
 //! Deploys an nginx pod, drives a `Forwarder` against it through three
 //! phases:
-//!   1. baseline: 3 multiplexed `GET /` over one upgrade
-//!   2. churn: force-delete the pod, recreate it, watch the Forwarder
-//!      retarget; another GET succeeds
-//!   3. shutdown: cancel the token, observe graceful drain
+//!   1. three `GET /` over one upgrade
+//!   2. force-delete the pod, recreate it, watch the Forwarder retarget; and
+//!      validates another GET succeeds
+//!   3. cancel the token, see graceful drain
 //!
 //! Run:
 //! ```text
@@ -48,9 +46,9 @@ async fn main() -> anyhow::Result<()> {
     let kube_client = kube::Client::try_from(config)?;
 
     common::ensure_nginx_pod(&kube_client, NAMESPACE, POD).await?;
-    let result = run(&kube_client, cluster_url).await;
+    let run_result = run(&kube_client, cluster_url).await;
     common::delete_pod(&kube_client, NAMESPACE, POD).await;
-    result
+    run_result
 }
 
 async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Result<()> {
@@ -79,23 +77,24 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
     wait_for_ready_pod(&forwarder, Duration::from_secs(30)).await?;
     println!("* target pod {:?}", forwarder.ready_pod());
 
-    // ── Phase 1: baseline ─────────────────────────────────────────────
     println!();
     println!("* phase 1: {CONCURRENT_STREAMS} multiplexed GETs over one upgrade");
     fan_out(&forwarder).await?;
 
-    // ── Phase 2: pod churn ────────────────────────────────────────────
     println!();
     println!("* phase 2: simulating pod restart");
     common::force_delete_and_wait(kube_client, NAMESPACE, POD).await?;
-    // Pod is gone. Forwarder loses its session; on_recovery fires.
+    // Pod is gone. Forwarder loses its session;
     common::ensure_nginx_pod(kube_client, NAMESPACE, POD).await?;
     // PodWatcher sees the new pod and the Forwarder retargets automatically.
     wait_for_ready_pod(&forwarder, Duration::from_secs(30)).await?;
-    println!("* target pod {:?}  (auto-retargeted)", forwarder.ready_pod());
+    println!(
+        "* target pod {:?}  (auto-retargeted)",
+        forwarder.ready_pod()
+    );
     fan_out(&forwarder).await?;
 
-    // ── Phase 3: graceful shutdown ────────────────────────────────────
+    // graceful shutdown
     println!();
     println!("* phase 3: cancel + graceful drain");
     cancel.cancel();
@@ -109,7 +108,7 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
     Ok(())
 }
 
-/// Fire `CONCURRENT_STREAMS` parallel GETs through one Forwarder.
+/// Fire parallel GETs through one Forwarder.
 async fn fan_out(forwarder: &Arc<Forwarder>) -> anyhow::Result<()> {
     let mut tasks = Vec::with_capacity(CONCURRENT_STREAMS);
     for i in 0..CONCURRENT_STREAMS {
@@ -118,8 +117,8 @@ async fn fan_out(forwarder: &Arc<Forwarder>) -> anyhow::Result<()> {
             let mut stream = fwd.connect(PORT).await?;
             let req = format!("GET /?stream={i} HTTP/1.0\r\nHost: localhost\r\n\r\n");
             stream.write_all(req.as_bytes()).await?;
-            // HTTP/1.0: server closes after the response, so read_to_end
-            // gives us the full payload in a deterministic byte count.
+            // HTTP server closes after the response, so read_to_end
+            // gives the full payload in a deterministic byte count.
             let mut buf = Vec::with_capacity(4096);
             stream.read_to_end(&mut buf).await?;
             let status = std::str::from_utf8(&buf[..buf.len().min(64)])

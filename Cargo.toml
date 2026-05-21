@@ -33,7 +33,7 @@ hyper-util = { version = "0.1.20", features = [
 k8s-openapi = { version = "0.27.1", default-features = false, features = [
   "latest",
 ] }
-kube = { version = "3.1.0", features = [
+kube = { version = "2.0.1", features = [
   "client",
   "config",
   "http-proxy",
@@ -43,7 +43,7 @@ kube = { version = "3.1.0", features = [
   "rustls-tls",
   "ws",
 ] }
-kube-runtime = { version = "3.1.0", features = ["unstable-runtime"] }
+kube-runtime = { version = "2.0.1", features = ["unstable-runtime"] }
 parking_lot = "0.12"
 quanta = "0.12"
 rand = "0.10"

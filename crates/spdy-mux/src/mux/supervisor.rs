@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 /// When any task panics (`JoinError::is_panic()`):
 /// - Logs the panic with `error!`
 /// - Marks session poisoned (cancel token)
-/// - Does NOT restart. A panic kills the session permanently. Restart at the
+/// - Doesn't restart. A panic kills the session permanently. Restart at the
 ///   Forwarder layer.
 pub(super) async fn supervise(
     writer_handle: JoinHandle<&'static str>, reader_handle: JoinHandle<&'static str>,

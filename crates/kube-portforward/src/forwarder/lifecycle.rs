@@ -35,7 +35,7 @@ impl Forwarder {
         );
         let pod_uid = ready.uid.clone().unwrap_or_else(|| ready.name.clone());
 
-        // Fast path: check under read lock.
+        // fast path: check under read lock.
         let needs_drain = {
             let pool = self.sessions.read().await;
             pool.target_pod_uid.as_deref() != Some(pod_uid.as_str())
@@ -43,7 +43,7 @@ impl Forwarder {
         if needs_drain {
             let drained: Vec<_> = {
                 let mut pool = self.sessions.write().await;
-                // Re-check under write lock (another task may have already drained).
+                // re-check under write lock (another task may have already drained).
                 if pool.target_pod_uid.as_deref() == Some(pod_uid.as_str()) {
                     Vec::new()
                 } else {
@@ -58,7 +58,7 @@ impl Forwarder {
             }
         }
 
-        // Fast path: reuse an existing non-full session.
+        // reuse an existing non-full session.
         if let Some(s) = self
             .try_reuse_session(target_port, &pod_uid, &ready.name)
             .await
@@ -66,12 +66,10 @@ impl Forwarder {
             return Ok(s);
         }
 
-        // Coalescing gate: if another caller is already opening a session,
-        // wait for it instead of opening a duplicate. Without this, N
-        // concurrent callers each create their own session (N × 4 WS
-        // connections) when one session can serve them all.
+        //  if another caller is already opening a session,
+        // wait for it instead of opening a duplicate
         //
-        // CRITICAL: The `Notified` future MUST be created while holding
+        // `Notified` future must be created while holding
         // the pool lock (before `drop(pool)`). If created after the lock
         // is dropped, `notify_waiters()` can fire in the gap between
         // `drop(pool)` and `notified()`, causing the notification to be
@@ -79,8 +77,8 @@ impl Forwarder {
         {
             let pool = self.sessions.read().await;
             if pool.has_pending_or_available() {
-                // Register the waiter BEFORE releasing the lock. Creating
-                // the Notified future alone is not enough — registration
+                // register the waiter before releasing the lock. Creating
+                // the Notified future alone is not enough, registration
                 // happens on first poll, not on creation. enable() forces
                 // registration so any notify_waiters() that fires between
                 // drop(pool) and the .await is captured.
@@ -89,14 +87,13 @@ impl Forwarder {
                 notified.as_mut().enable();
                 drop(pool);
                 let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
-                // Re-check: the newly created session should be available now.
+                // newly created session should be available now.
                 if let Some(s) = self
                     .try_reuse_session(target_port, &pod_uid, &ready.name)
                     .await
                 {
                     return Ok(s);
                 }
-                // Fall through to create a new session if the in-flight one
                 // failed or was full.
             }
         }
@@ -109,7 +106,7 @@ impl Forwarder {
             return Ok(s);
         }
 
-        // RAII slot: decrements opening_count on drop, cancel-safe.
+        // decrements opening_count on drop, cancel safe.
         let _slot = self.reserve_new_slot().await?;
 
         let permit = tokio::time::timeout(
@@ -151,7 +148,7 @@ impl Forwarder {
         pool.refresh_snapshot();
         drop(pool);
 
-        // Wake all callers waiting at the coalescing gate so they can
+        // wake all callers waiting at the coalescing gate so they can
         // reuse this session instead of opening more.
         self.session_ready.notify_waiters();
 
