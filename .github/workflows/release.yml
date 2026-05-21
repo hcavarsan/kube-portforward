@@ -16,7 +16,7 @@ on:
           - kube-portforward
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -50,3 +50,9 @@ jobs:
         run: cargo publish -p ${{ steps.which.outputs.crate }} --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.which.outputs.crate }} ${{ github.ref_name }}
+          generate_release_notes: true
