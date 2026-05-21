@@ -1,0 +1,66 @@
+[tools]
+# No tool pins beyond rust-toolchain.toml; cargo-release installed lazily by the release task.
+
+[tasks.build]
+description = "Build the workspace (debug)"
+run = "cargo build --workspace --all-features"
+
+[tasks.check]
+description = "cargo check across workspace"
+run = "cargo check --workspace --all-targets --all-features"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace --all-features --lib --bins --tests"
+
+[tasks.lint]
+description = "Clippy with -D warnings (auto-fix)"
+run = "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged -- -D warnings"
+
+[tasks.fmt]
+description = "Format with nightly rustfmt"
+run = "rustup run nightly cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting without writing"
+run = "rustup run nightly cargo fmt --all -- --check"
+
+[tasks.doc]
+description = "Build rustdoc for the workspace"
+run = "cargo doc --workspace --no-deps"
+
+[tasks.examples]
+description = "Compile-check all examples"
+run = "cargo check --workspace --examples --all-features"
+
+[tasks.precommit]
+description = "Pre-commit: fmt + lint + test"
+depends = ["fmt", "lint", "test"]
+
+[tasks."release:install"]
+description = "Install cargo-release if missing"
+run = '''
+if ! command -v cargo-release >/dev/null 2>&1; then
+  cargo install cargo-release --locked
+fi
+'''
+
+[tasks."release:dry"]
+description = "Dry-run release (no publish, no tag)"
+depends = ["release:install"]
+run = "cargo release --workspace --no-publish --no-tag --no-push"
+
+[tasks."release:patch"]
+description = "Bump patch version + create tag (does NOT push; CI publishes on tag)"
+depends = ["release:install"]
+run = "cargo release patch --workspace --execute --no-publish --no-push"
+
+[tasks."release:minor"]
+description = "Bump minor version + create tag"
+depends = ["release:install"]
+run = "cargo release minor --workspace --execute --no-publish --no-push"
+
+[tasks."release:major"]
+description = "Bump major version + create tag"
+depends = ["release:install"]
+run = "cargo release major --workspace --execute --no-publish --no-push"

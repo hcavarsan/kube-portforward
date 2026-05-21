@@ -1,0 +1,127 @@
+[workspace]
+resolver = "2"
+members = ["crates/spdy-mux", "crates/kube-portforward"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/hcavarsan/kube-portforward"
+homepage = "https://github.com/hcavarsan/kube-portforward"
+authors = ["Henrique Cavarsan <hcavarsan@gmail.com>"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+arc-swap = "1.9"
+base64 = "0.22"
+bytes = "1.11"
+crossbeam-queue = "0.3"
+fastwebsockets = { version = "0.10", features = ["unstable-split"] }
+flate2 = "1.1"
+futures = "0.3"
+http = "1.4"
+hyper = { version = "1.9.0", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = [
+  "client",
+  "client-legacy",
+  "client-proxy",
+  "http1",
+  "server",
+  "tokio",
+] }
+k8s-openapi = { version = "0.27.1", default-features = false, features = [
+  "latest",
+] }
+kube = { version = "3.1.0", features = [
+  "client",
+  "config",
+  "http-proxy",
+  "oauth",
+  "openssl-tls",
+  "runtime",
+  "rustls-tls",
+  "ws",
+] }
+kube-runtime = { version = "3.1.0", features = ["unstable-runtime"] }
+parking_lot = "0.12"
+quanta = "0.12"
+rand = "0.10"
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+spdy-mux = { version = "0.1", path = "crates/spdy-mux" }
+kube-portforward = { version = "0.1", path = "crates/kube-portforward" }
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_safety_doc = "allow"
+doc_markdown = "allow"
+too_long_first_doc_paragraph = "allow"
+missing_docs_in_private_items = "allow"
+
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+too_many_lines = "allow"
+too_many_arguments = "allow"
+struct_excessive_bools = "allow"
+
+items_after_statements = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+redundant_else = "allow"
+match_same_arms = "allow"
+option_if_let_else = "allow"
+map_unwrap_or = "allow"
+
+redundant_pub_crate = "allow"
+
+unused_async = "allow"
+unused_self = "allow"
+unnecessary_wraps = "allow"
+
+significant_drop_tightening = "allow"
+branches_sharing_code = "allow"
+future_not_send = "allow"
+
+duration_suboptimal_units = "allow"
+unnecessary_debug_formatting = "allow"
+ip_constant = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
