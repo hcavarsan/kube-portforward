@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  rustfmt:
+    name: rustfmt (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - name: cargo +nightly fmt --check
+        run: cargo +nightly fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.toolchain }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: ["1.85", stable, beta]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+      - uses: swatinem/rust-cache@5e4a76743357a1c3c57315bc1896d2c7f89d6861
+        with:
+          shared-key: clippy-${{ matrix.os }}-${{ matrix.toolchain }}
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.toolchain }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: ["1.85", stable, beta]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: swatinem/rust-cache@5e4a76743357a1c3c57315bc1896d2c7f89d6861
+        with:
+          shared-key: test-${{ matrix.os }}-${{ matrix.toolchain }}
+      - name: cargo test
+        run: cargo test --workspace --all-features --lib --bins --tests
+
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: stable
+      - uses: swatinem/rust-cache@5e4a76743357a1c3c57315bc1896d2c7f89d6861
+        with:
+          shared-key: doc
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --all-features
+
+  examples:
+    name: examples (check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: stable
+      - uses: swatinem/rust-cache@5e4a76743357a1c3c57315bc1896d2c7f89d6861
+        with:
+          shared-key: examples
+      - name: cargo check --examples
+        run: cargo check --workspace --examples --all-features

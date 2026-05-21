@@ -1,0 +1,4 @@
+*                                @hcavarsan
+/crates/spdy-mux/                @hcavarsan
+/crates/kube-portforward/        @hcavarsan
+/.github/                        @hcavarsan
