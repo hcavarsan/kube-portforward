@@ -115,6 +115,7 @@ duration_suboptimal_units = "allow"
 unnecessary_debug_formatting = "allow"
 ip_constant = "allow"
 case_sensitive_file_extension_comparisons = "allow"
+collapsible_if = "allow"
 
 [profile.dev]
 incremental = true
