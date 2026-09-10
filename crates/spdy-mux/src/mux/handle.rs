@@ -335,7 +335,7 @@ impl MuxHandle {
     /// hard cap). If at cap, returns `Error::CapacityExhausted` immediately.
     /// Failures during the later realization step surface as I/O errors
     /// on `poll_write`.
-    pub(crate) async fn open_stream_pair(
+    pub(crate) fn open_stream_pair(
         &self, error_headers: Vec<(String, String)>, data_headers: Vec<(String, String)>,
     ) -> Result<Stream, Error> {
         if self.closed.is_cancelled() {

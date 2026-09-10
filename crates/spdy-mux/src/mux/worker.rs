@@ -116,20 +116,25 @@ pub(super) fn dispatch_frame_in_worker(
             if !payload.is_empty() {
                 let payload_len = payload.len() as u64;
 
-                // session-level recv window is tracked by the reader (not here).
+                // session-level recv window is tracked by the reader (not
+                // here).
                 let mut remove = false;
 
                 if let Some(state) = streams.get_mut(&stream_id) {
-                    // Only send data if the data_tx is still open (not half-closed)
+                    // Only send data if the data_tx is still open (not
+                    // half-closed)
                     if let Some(ref data_tx) = state.data_tx {
                         match data_tx.try_send(payload) {
                             Ok(()) => {
-                                // track consumed bytes since last per-stream WINDOW_UPDATE.
+                                // track consumed bytes since last per-stream
+                                // WINDOW_UPDATE.
                                 state.consumed_since_update += payload_len;
                                 if state.consumed_since_update >= (initial_window_size / 2) as u64 {
                                     let delta = state.consumed_since_update as u32;
-                                    // only reset on success; if the channel is full,
-                                    // accumulate and retry on the next DATA frame.
+                                    // only reset on success; if the channel is
+                                    // full,
+                                    // accumulate and retry on the next DATA
+                                    // frame.
                                     if window_tx
                                         .try_send(MuxCommand::EncodeWindowUpdate {
                                             stream_id,
@@ -142,10 +147,13 @@ pub(super) fn dispatch_frame_in_worker(
                                 }
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // on buffer-full: do NOT send RST_STREAM. Stop draining frame_rx
+                                // on buffer-full: do NOT send RST_STREAM. Stop
+                                // draining frame_rx
                                 // instead; the reader backs up, TCP
-                                // applies backpressure to the peer, the peer slows down. The frame
-                                // is "lost" for this try, but the per-stream recv window is not
+                                // applies backpressure to the peer, the peer
+                                // slows down. The frame
+                                // is "lost" for this try, but the per-stream
+                                // recv window is not
                                 // replenished (no WINDOW_UPDATE),
                                 // so the peer naturally pauses sending to this
                                 // stream.
@@ -162,10 +170,12 @@ pub(super) fn dispatch_frame_in_worker(
                     // if data_tx is None (half-closed), silently ignore. The
                     // stream entry is kept for WINDOW_UPDATE processing.
                 } else {
-                    // trace level: routinely fires during connection teardown when
-                    // late DATA frames arrive for streams we've already closed.
-                    // the RST_STREAM response is correct per SPDY spec; only the
-                    // log noise is undesirable at DEBUG.
+                    // trace level: routinely fires during connection teardown
+                    // when late DATA frames arrive for
+                    // streams we've already closed.
+                    // the RST_STREAM response is correct per SPDY spec; only
+                    // the log noise is undesirable at
+                    // DEBUG.
                     tracing::trace!(
                         stream_id,
                         "SPDY DATA for unknown stream, sending RST_STREAM"
@@ -186,10 +196,10 @@ pub(super) fn dispatch_frame_in_worker(
                 }
             }
 
-            // half-close: remote FIN means peer is done sending. Close our data Sender so
-            // the consumer reads EOF, but keep the stream entry alive for
-            // outgoing WINDOW_UPDATE processing. Full cleanup happens when
-            // StreamGuard fires Close.
+            // half-close: remote FIN means peer is done sending. Close our data
+            // Sender so the consumer reads EOF, but keep the stream
+            // entry alive for outgoing WINDOW_UPDATE processing.
+            // Full cleanup happens when StreamGuard fires Close.
             if fin {
                 if let Some(state) = streams.get_mut(&stream_id) {
                     tracing::debug!(stream_id, "SPDY DATA FIN received, half-closing read side");

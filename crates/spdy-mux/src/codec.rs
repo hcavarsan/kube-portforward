@@ -117,8 +117,8 @@ impl SpdyCodec {
     ) -> Result<Vec<u8>, Error> {
         let compressed_headers = self.compress_headers(headers)?;
 
-        // SYN_STREAM payload: stream_id(4) + assoc_id(4) + priority(1) + slot(1) +
-        // headers
+        // SYN_STREAM payload: stream_id(4) + assoc_id(4) + priority(1) +
+        // slot(1) + headers
         let payload_len = 10 + compressed_headers.len();
         let mut frame = Vec::with_capacity(8 + payload_len);
 
@@ -370,8 +370,9 @@ impl SpdyCodec {
                         if offset + 8 > payload.len() {
                             break;
                         }
-                        // id is in bytes [offset+1..offset+4] (3 bytes, big-endian,
-                        // first byte is flags per SPDY/3.1 spec)
+                        // id is in bytes [offset+1..offset+4] (3 bytes,
+                        // big-endian, first byte is
+                        // flags per SPDY/3.1 spec)
                         let id = u32::from_be_bytes([
                             0,
                             payload[offset + 1],

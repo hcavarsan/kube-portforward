@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-homepage.workspace = true
 description = "SPDY/3.1 stream multiplexer over WebSocket transports"
 keywords = ["spdy", "multiplexer", "websocket", "async", "tokio"]
 categories = ["network-programming", "asynchronous"]

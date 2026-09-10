@@ -255,11 +255,13 @@ pub(super) fn route_frame(frame: Frame, ctx: &mut ReaderContext<'_>) -> Result<(
                 if *ctx.session_recv_consumed >= (ctx.config.initial_window_size / 2) as u64 {
                     let delta = *ctx.session_recv_consumed as u32;
                     // only reset the counter on successful send. If the channel
-                    // is full, the accumulated bytes carry over to the next DATA
-                    // frame and we retry then. WINDOW_UPDATE deltas are additive,
-                    // so accumulating across tries is safe. Resetting on
-                    // failure causes the peer's view of our recv window to drift
-                    // monotonically toward zero, the root cause of the 45s stall.
+                    // is full, the accumulated bytes carry over to the next
+                    // DATA frame and we retry then.
+                    // WINDOW_UPDATE deltas are additive, so
+                    // accumulating across tries is safe. Resetting on
+                    // failure causes the peer's view of our recv window to
+                    // drift monotonically toward zero, the
+                    // root cause of the 45s stall.
                     if ctx
                         .channels
                         .window_tx

@@ -98,116 +98,118 @@ impl Drop for PodWatcher {
 
 impl PodWatcher {
     /// Start a watcher against `namespace` selecting pods by `selector`.
-    pub async fn new(
+    pub fn new(
         client: kube::Client, namespace: &str, selector: PodSelector,
-    ) -> Result<Self, Error> {
-        let label_expr = match &selector {
-            PodSelector::Labels { selector } => selector.clone(),
-            PodSelector::Name(_) => String::new(),
-        };
+    ) -> impl Future<Output = Result<Self, Error>> {
+        futures::future::lazy(move |_| {
+            let label_expr = match &selector {
+                PodSelector::Labels { selector } => selector.clone(),
+                PodSelector::Name(_) => String::new(),
+            };
 
-        let (store, writer) = reflector::store_shared(256);
-        let subscriber = writer.subscribe().ok_or_else(|| {
-            Error::Configuration("failed to create pod reflector subscriber".into())
-        })?;
+            let (store, writer) = reflector::store_shared(256);
+            let subscriber = writer.subscribe().ok_or_else(|| {
+                Error::Configuration("failed to create pod reflector subscriber".into())
+            })?;
 
-        let cancel = CancellationToken::new();
-        let latest_ready: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
-        let (change_tx, _) = broadcast::channel(16);
+            let cancel = CancellationToken::new();
+            let latest_ready: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+            let (change_tx, _) = broadcast::channel(16);
 
-        let pods_api: Api<Pod> = Api::namespaced(client, namespace);
-        let watcher_config = if label_expr.is_empty() {
-            WatcherConfig::default()
-        } else {
-            WatcherConfig::default().labels(&label_expr)
-        };
+            let pods_api: Api<Pod> = Api::namespaced(client, namespace);
+            let watcher_config = if label_expr.is_empty() {
+                WatcherConfig::default()
+            } else {
+                WatcherConfig::default().labels(&label_expr)
+            };
 
-        let reflector_cancel = cancel.clone();
-        let reflector_latest = Arc::clone(&latest_ready);
-        let reflector_change_tx = change_tx.clone();
-        let reflector_task = tokio::spawn(async move {
-            let stream = watcher::watcher(pods_api, watcher_config)
-                .default_backoff()
-                .modify(|pod| {
-                    pod.managed_fields_mut().clear();
-                    pod.annotations_mut().clear();
-                    if let Some(status) = &mut pod.status {
-                        status.container_statuses = None;
-                        status.init_container_statuses = None;
-                        status.ephemeral_container_statuses = None;
-                    }
-                })
-                .reflect_shared(writer);
+            let reflector_cancel = cancel.clone();
+            let reflector_latest = Arc::clone(&latest_ready);
+            let reflector_change_tx = change_tx.clone();
+            let reflector_task = tokio::spawn(async move {
+                let stream = watcher::watcher(pods_api, watcher_config)
+                    .default_backoff()
+                    .modify(|pod| {
+                        pod.managed_fields_mut().clear();
+                        pod.annotations_mut().clear();
+                        if let Some(status) = &mut pod.status {
+                            status.container_statuses = None;
+                            status.init_container_statuses = None;
+                            status.ephemeral_container_statuses = None;
+                        }
+                    })
+                    .reflect_shared(writer);
 
-            let mut stream = std::pin::pin!(stream);
-            loop {
-                tokio::select! {
-                    biased;
-                    () = reflector_cancel.cancelled() => break,
-                    next = stream.next() => match next {
-                        Some(Ok(watcher::Event::Delete(pod))) => {
-                            let name = pod.name_any();
-                            let prev = reflector_latest.rcu(|cur| {
-                                if cur.as_deref().is_some_and(|c| c.name == name) {
-                                    None
-                                } else {
-                                    cur.clone()
+                let mut stream = std::pin::pin!(stream);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = reflector_cancel.cancelled() => break,
+                        next = stream.next() => match next {
+                            Some(Ok(watcher::Event::Delete(pod))) => {
+                                let name = pod.name_any();
+                                let prev = reflector_latest.rcu(|cur| {
+                                    if cur.as_deref().is_some_and(|c| c.name == name) {
+                                        None
+                                    } else {
+                                        cur.clone()
+                                    }
+                                });
+                                if prev.as_deref().is_some_and(|c| c.name == name) {
+                                    let _ = reflector_change_tx.send(PodChange::Died(name));
                                 }
-                            });
-                            if prev.as_deref().is_some_and(|c| c.name == name) {
-                                let _ = reflector_change_tx.send(PodChange::Died(name));
                             }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => {
-                            error!("pod reflector error: {}", e);
-                            tokio::select! {
-                                biased;
-                                () = reflector_cancel.cancelled() => break,
-                                () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                error!("pod reflector error: {}", e);
+                                tokio::select! {
+                                    biased;
+                                    () = reflector_cancel.cancelled() => break,
+                                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                                }
                             }
-                        }
-                        None => break,
-                    },
+                            None => break,
+                        },
+                    }
                 }
-            }
-        });
+            });
 
-        let subscriber_cancel = cancel.clone();
-        let subscriber_latest = Arc::clone(&latest_ready);
-        let subscriber_change_tx = change_tx.clone();
-        let subscriber_selector = selector.clone();
-        let subscriber_handle = subscriber.clone();
-        let subscriber_task = tokio::spawn(async move {
-            let mut stream = std::pin::pin!(subscriber_handle);
-            loop {
-                tokio::select! {
-                    biased;
-                    () = subscriber_cancel.cancelled() => break,
-                    next = stream.next() => match next {
-                        Some(pod) => {
-                            update_latest(
-                                &subscriber_latest,
-                                &pod,
-                                &subscriber_selector,
-                                &subscriber_change_tx,
-                            );
-                        }
-                        None => break,
-                    },
+            let subscriber_cancel = cancel.clone();
+            let subscriber_latest = Arc::clone(&latest_ready);
+            let subscriber_change_tx = change_tx.clone();
+            let subscriber_selector = selector.clone();
+            let subscriber_handle = subscriber.clone();
+            let subscriber_task = tokio::spawn(async move {
+                let mut stream = std::pin::pin!(subscriber_handle);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = subscriber_cancel.cancelled() => break,
+                        next = stream.next() => match next {
+                            Some(pod) => {
+                                update_latest(
+                                    &subscriber_latest,
+                                    &pod,
+                                    &subscriber_selector,
+                                    &subscriber_change_tx,
+                                );
+                            }
+                            None => break,
+                        },
+                    }
                 }
-            }
-        });
+            });
 
-        Ok(Self {
-            store,
-            _subscriber: subscriber,
-            latest_ready,
-            change_tx,
-            selector,
-            reflector_task,
-            subscriber_task,
-            cancel,
+            Ok(Self {
+                store,
+                _subscriber: subscriber,
+                latest_ready,
+                change_tx,
+                selector,
+                reflector_task,
+                subscriber_task,
+                cancel,
+            })
         })
     }
 

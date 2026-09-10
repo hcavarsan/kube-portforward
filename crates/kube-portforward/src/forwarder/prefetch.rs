@@ -17,9 +17,10 @@ impl Forwarder {
     pub(super) async fn maybe_prefetch(
         &self, session: &Arc<Session>, target_port: u16, pod_name: String, pod_uid: String,
     ) {
-        // replenish spare streams if below low watermark (non-blocking best-effort).
-        // `replenish_spare_streams` internally guards against concurrent runs
-        // via a CAS, so spawning multiple tasks is safe but wasteful.
+        // replenish spare streams if below low watermark (non-blocking
+        // best-effort). `replenish_spare_streams` internally guards
+        // against concurrent runs via a CAS, so spawning multiple tasks
+        // is safe but wasteful.
         if session.needs_replenish() && !session.is_full() {
             let session_clone = Arc::clone(session);
             self.background_tasks.lock().await.spawn(async move {

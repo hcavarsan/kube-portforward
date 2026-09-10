@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-homepage.workspace = true
 description = "Kubernetes port-forward over SPDY/3.1 with kubectl-style WebSocket with raw fallback"
 keywords = ["kubernetes", "portforward", "spdy", "async", "tokio"]
 categories = ["network-programming", "asynchronous"]

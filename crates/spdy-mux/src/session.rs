@@ -62,7 +62,8 @@ impl HandleMetrics {
                 // new peak: adopt immediately for fast spike adaptation.
                 elapsed_ns
             } else {
-                // decay toward current measurement: new = prev*0.9 + elapsed*0.1
+                // decay toward current measurement: new = prev*0.9 +
+                // elapsed*0.1
                 (prev / 10) * 9 + elapsed_ns / 10
             };
             match self.rtt_ns.compare_exchange_weak(
@@ -195,46 +196,46 @@ impl Session {
     /// `error_headers` and `data_headers` are passed verbatim to the codec
     /// as the SYN_STREAM header block for the respective stream. The
     /// session doesn't interpret them.
-    pub async fn open_stream_pair(
+    pub fn open_stream_pair(
         &self, error_headers: Vec<(String, String)>, data_headers: Vec<(String, String)>,
-    ) -> Result<Stream, Error> {
-        let pool_size = self.pool.len();
+    ) -> impl Future<Output = Result<Stream, Error>> {
+        futures::future::lazy(move |_| {
+            let pool_size = self.pool.len();
 
-        if pool_size >= 2 {
-            let (a, b) = self.pick_two(pool_size);
-            let preferred = if self.handle_cost(a) <= self.handle_cost(b) {
-                [a, b]
-            } else {
-                [b, a]
-            };
-            for &idx in &preferred {
-                if let Some(stream) = self
-                    .try_open(idx, error_headers.clone(), data_headers.clone())
-                    .await?
+            if pool_size >= 2 {
+                let (a, b) = self.pick_two(pool_size);
+                let preferred = if self.handle_cost(a) <= self.handle_cost(b) {
+                    [a, b]
+                } else {
+                    [b, a]
+                };
+                for &idx in &preferred {
+                    if let Some(stream) =
+                        self.try_open(idx, error_headers.clone(), data_headers.clone())?
+                    {
+                        return Ok(stream);
+                    }
+                }
+            }
+
+            for round in 0..pool_size {
+                let idx = self.next.fetch_add(1, Ordering::Relaxed) % pool_size;
+                if let Some(stream) =
+                    self.try_open(idx, error_headers.clone(), data_headers.clone())?
                 {
                     return Ok(stream);
                 }
+                tracing::debug!(
+                    handle = idx,
+                    round,
+                    "SPDY session: handle unavailable, trying next"
+                );
             }
-        }
 
-        for round in 0..pool_size {
-            let idx = self.next.fetch_add(1, Ordering::Relaxed) % pool_size;
-            if let Some(stream) = self
-                .try_open(idx, error_headers.clone(), data_headers.clone())
-                .await?
-            {
-                return Ok(stream);
-            }
-            tracing::debug!(
-                handle = idx,
-                round,
-                "SPDY session: handle unavailable, trying next"
-            );
-        }
-
-        Err(Error::CapacityExhausted {
-            in_use: self.in_use(),
-            limit: self.capacity() as u32,
+            Err(Error::CapacityExhausted {
+                in_use: self.in_use(),
+                limit: self.capacity() as u32,
+            })
         })
     }
 
@@ -246,7 +247,7 @@ impl Session {
     /// to avoid contaminating the load estimate with capacity-rejection
     /// latency (which is fast and unrepresentative of actual stream-open
     /// cost).
-    async fn try_open(
+    fn try_open(
         &self, idx: usize, error_headers: Vec<(String, String)>,
         data_headers: Vec<(String, String)>,
     ) -> Result<Option<Stream>, Error> {
@@ -255,7 +256,7 @@ impl Session {
             return Ok(None);
         }
         let sample = self.metrics[idx].start_sample();
-        match mux.open_stream_pair(error_headers, data_headers).await {
+        match mux.open_stream_pair(error_headers, data_headers) {
             Ok(stream) => {
                 sample.complete();
                 tracing::debug!(
@@ -342,8 +343,11 @@ impl Session {
     }
 
     /// Close the SPDY session by cancelling the mux tasks.
-    pub async fn close(self) -> Result<(), Error> {
-        self.cancel.cancel();
-        Ok(())
+    pub fn close(self) -> impl Future<Output = Result<(), Error>> {
+        futures::future::lazy(move |_| {
+            self.cancel.cancel();
+            drop(self);
+            Ok(())
+        })
     }
 }

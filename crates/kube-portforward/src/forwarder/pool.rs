@@ -100,7 +100,7 @@ pub(super) async fn drain_and_cancel_all(sessions: &TokioRwLock<SessionPool>) {
     let drained: Vec<PooledSession> = {
         let mut pool = sessions.write().await;
         pool.target_pod_uid = None;
-        let drained = pool.entries.drain(..).collect();
+        let drained = std::mem::take(&mut pool.entries);
         pool.refresh_snapshot();
         drained
     };

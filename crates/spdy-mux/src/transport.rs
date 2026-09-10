@@ -120,10 +120,6 @@ pub trait WsFrameWriter: Send {
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
 
     /// Flush all buffered data to the underlying transport.
-    ///
-    /// For tungstenite, flushes the Sink's internal buffer.
-    /// For fastwebsockets, this is a no-op. See [`FastWsWriter::flush`]
-    /// for the rationale.
     fn flush(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;
 
     /// Send a WebSocket Close frame and shut down the write half.
@@ -181,26 +177,7 @@ impl<S: AsyncWrite + Unpin + Send> WsFrameWriter for FastWsWriter<S> {
     }
 
     async fn flush(&mut self) -> Result<(), TransportError> {
-        // no-op. fastwebsockets writes through AsyncWrite::write_all (for
-        // small frames) or write_vectored (for frames > writev_threshold),
-        // both of which guarantee data has been written to the underlying
-        // stream before returning.
-        //
-        // no application-level buffer exists at this layer:
-        //
-        // - fastwebsockets has no internal write queue. write_frame writes directly to
-        //   the stream and returns only after write_all completes.
-        //
-        // - the TLS layer (openssl, configured by kube-rs) emits a TLS record per write
-        //   call. There is no record-coalescing buffer that flush() would drain.
-        //
-        // - the TCP layer has TCP_NODELAY set (in client.rs socket config), disabling
-        //   Nagle's algorithm. Data enters the kernel send buffer and is transmitted
-        //   immediately.
-        //
-        // if a future change introduces a buffering layer between this
-        // adapter and the socket (e.g., BufWriter for write coalescing),
-        // this method must be updated to propagate flush.
+        self.ws.flush().await?;
         Ok(())
     }
 
@@ -370,11 +347,13 @@ impl<W: AsyncWrite + Unpin + Send> WsFrameWriter for RawSpdyWriter<W> {
         Ok(())
     }
 
-    async fn write_pong(&mut self, _payload: Bytes) -> Result<(), TransportError> {
+    fn write_pong(
+        &mut self, _payload: Bytes,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
         // raw SPDY has no WebSocket-level PING/PONG. the mux only invokes
         // this in response to a `WsMessage::Ping`, which the raw reader
         // never produces, so this path is unreachable in practice.
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn flush(&mut self) -> Result<(), TransportError> {
@@ -442,4 +421,51 @@ where
         RawSpdyWriter::new(write_half),
         RawSpdyReader::new(read_half),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn flush_delivers_buffered_websocket_frame() {
+        let (client, server) = tokio::io::duplex(1024);
+        let buffered = tokio::io::BufStream::with_capacity(1024, 1024, client);
+        let (mut writer, _reader) = split_fastws(buffered);
+        let mut peer =
+            fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+
+        writer
+            .write_binary(Bytes::from_static(b"buffered frame"))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), peer.read_frame())
+            .await
+            .expect("flushed data must reach the peer")
+            .unwrap();
+        assert_eq!(frame.opcode, fastwebsockets::OpCode::Binary);
+        assert_eq!(&*frame.payload, b"buffered frame");
+    }
+
+    #[tokio::test]
+    async fn flush_reports_buffered_transport_failure() {
+        let (client, server) = tokio::io::duplex(1024);
+        let buffered = tokio::io::BufStream::with_capacity(1024, 1024, client);
+        let (mut writer, _reader) = split_fastws(buffered);
+
+        writer
+            .write_binary(Bytes::from_static(b"buffered frame"))
+            .await
+            .unwrap();
+        drop(server);
+
+        writer
+            .flush()
+            .await
+            .expect_err("flushing to a closed peer must fail");
+    }
 }

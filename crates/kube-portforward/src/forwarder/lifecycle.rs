@@ -43,12 +43,13 @@ impl Forwarder {
         if needs_drain {
             let drained: Vec<_> = {
                 let mut pool = self.sessions.write().await;
-                // re-check under write lock (another task may have already drained).
+                // re-check under write lock (another task may have already
+                // drained).
                 if pool.target_pod_uid.as_deref() == Some(pod_uid.as_str()) {
                     Vec::new()
                 } else {
                     pool.target_pod_uid = Some(pod_uid.clone());
-                    let drained = pool.entries.drain(..).collect();
+                    let drained = std::mem::take(&mut pool.entries);
                     pool.refresh_snapshot();
                     drained
                 }
