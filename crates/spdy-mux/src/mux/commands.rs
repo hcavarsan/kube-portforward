@@ -10,15 +10,14 @@ use super::window::SendWindow;
 
 /// Command sent to the writer task via `cmd_tx`.
 pub(crate) enum MuxCommand {
-    /// Open a paired stream (an "error" stream half-closed at open time +
-    /// a "data" stream that carries application bytes) and emit the
-    /// first DATA frame on the data stream,
-    OpenStreamPairAndWrite {
+    /// Open a paired stream: an "error" stream half-closed at open time
+    /// (empty DATA+FIN right after its SYN_STREAM) plus a "data" stream
+    /// that carries application bytes once the caller writes to it.
+    OpenStreamPair {
         error_id: u32,
         data_id: u32,
         error_headers: Vec<(String, String)>,
         data_headers: Vec<(String, String)>,
-        first_payload: Bytes,
     },
     /// Send a DATA frame
     SendData {
@@ -66,10 +65,10 @@ pub(crate) enum StreamRegistration {
     },
 }
 
-/// State protected by the per-handle open sequencer. Holds the
-/// SPDY stream ID counter. Wrapped in `tokio::sync::Mutex` so the open
-/// path can `.await` while holding it (reg_tx + cmd_tx sends are all
-/// `.await`).
+/// State protected by the per-handle open sequencer. Holds the SPDY
+/// stream ID counter. Wrapped in a `parking_lot::Mutex`: allocation,
+/// worker registration, and writer enqueue while holding it are all
+/// synchronous `try_send`/`try_reserve_owned` calls, never `.await`.
 pub(super) struct OpenState {
     /// Next client stream ID. spdy requires client
     /// streams to be odd and monotonically increasing.

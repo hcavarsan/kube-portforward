@@ -51,6 +51,7 @@ pub use forwarder::{
 };
 pub use pod_watch::{
     PodChange,
+    PodReadiness,
     PodSelector,
     PodWatcher,
     ReadyPod,

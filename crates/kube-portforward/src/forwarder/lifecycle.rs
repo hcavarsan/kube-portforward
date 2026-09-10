@@ -167,9 +167,6 @@ impl Forwarder {
         let cb = Arc::clone(&self.recovery_callback);
         self.pf_client
             .session(&*self.namespace, pod_name, port)
-            .capacity(self.config.session_capacity)
-            .keepalive(self.config.ping_interval, self.config.watchdog_timeout)
-            .shutdown_grace(self.config.shutdown_grace)
             .cancellation_token(self.session_cancel.child_token())
             .on_recovery(move |signal: RecoverySignal| (cb)(signal))
             .open()

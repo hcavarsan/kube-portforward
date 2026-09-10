@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +24,6 @@ use tokio::io::{
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
-use crate::error::Error;
 use crate::mux::{
     MuxCommand,
     MuxHandle,
@@ -40,10 +38,10 @@ use crate::mux::{
 ///
 /// Streams are **lazily opened on the wire**: `MuxHandle::open_stream_pair`
 /// reserves a session slot and creates the per-stream channels, but no
-/// SPDY `SYN_STREAM` frame is sent until the consumer actually writes its
-/// first byte. This avoids the idle-upstream-close race for peers that
-/// dial an upstream connection eagerly on `SYN_STREAM` while preserving
-/// the pre-opened spare-stream throughput optimization.
+/// SPDY `SYN_STREAM` frame is sent until the consumer actually writes or
+/// reads. This avoids the idle-upstream-close race for peers that dial
+/// an upstream connection eagerly on `SYN_STREAM` while preserving the
+/// pre-opened spare-stream throughput optimization.
 ///
 /// Implements `AsyncRead + AsyncWrite` on the data half. The error half is
 /// available via `split()`.
@@ -54,7 +52,7 @@ pub struct Stream {
 enum StreamState {
     /// Pair reserved, channels created, but no SPDY stream IDs allocated
     /// and no `SYN_STREAM` on the wire yet. Transitions to `Opened` on the
-    /// first non-empty `poll_write`.
+    /// first non-empty `poll_write`, or the first real `poll_read`.
     Unopened {
         error_headers: Vec<(String, String)>,
         data_headers: Vec<(String, String)>,
@@ -68,11 +66,6 @@ enum StreamState {
         max_frame_size: u32,
         read_buf: Option<Bytes>,
         read_eof: bool,
-        /// In-flight lazy-open future. `Some` once `poll_write` started
-        /// a realize call and the first poll returned `Pending`. The
-        /// future owns a clone of the first payload so cancellation safety
-        /// is preserved across re-polls.
-        open_in_progress: Option<LazyOpenFuture>,
         /// Guard that releases `active_pairs` on drop. Always present in
         /// the Unopened state.
         release_guard: Option<PairReleaseGuard>,
@@ -81,7 +74,6 @@ enum StreamState {
         data_id: u32,
         data_rx: mpsc::Receiver<Bytes>,
         error_rx: mpsc::Receiver<Bytes>,
-        mux: MuxHandle,
         write_tx: PollSender<MuxCommand>,
         send_window: Arc<SendWindow>,
         max_frame_size: u32,
@@ -94,9 +86,6 @@ enum StreamState {
     /// Shouldn't be seen by a user.
     Transitioning,
 }
-
-/// Boxed future driving a single lazy-open try.
-type LazyOpenFuture = Pin<Box<dyn Future<Output = Result<OpenedStreamParts, Error>> + Send>>;
 
 /// Guards the session's `active_pairs` counter for unopened streams.
 /// Once the stream realizes, the counter is owned by `StreamGuard` instead
@@ -155,7 +144,7 @@ impl Drop for StreamGuard {
         let graceful = self.graceful_shutdown.load(Ordering::Acquire);
 
         // the error stream is already half-closed at open time: the
-        // `OpenPortForwardAndWrite` writer command emitted an empty
+        // `OpenStreamPair` writer command emitted an empty
         // DATA+FIN on `error_id` right after the two SYN_STREAM frames
         // (matching kubectl's `errorStream.Close()` behavior). Sending
         // RST_STREAM here would be wrong — we never use the error stream
@@ -239,7 +228,6 @@ impl Stream {
                 max_frame_size,
                 read_buf: None,
                 read_eof: false,
-                open_in_progress: None,
                 release_guard: Some(release_guard),
             },
         }
@@ -266,8 +254,9 @@ impl Stream {
     /// Split into data half (AsyncRead + AsyncWrite) and error half
     /// (AsyncRead).
     ///
-    /// Splitting an unopened stream is supported: both halves share a
-    /// single `LazyOpenSlot` driven by the data half's first write.
+    /// Splitting an unopened stream is supported: both halves share the
+    /// same underlying open state, and whichever side reads or writes
+    /// first drives the (synchronous) realize call.
     pub fn split(self) -> (DataStream, ErrorStream) {
         match self.state {
             StreamState::Unopened {
@@ -281,8 +270,8 @@ impl Stream {
                 max_frame_size,
                 read_buf,
                 read_eof,
-                open_in_progress,
                 release_guard,
+                ..
             } => {
                 let shared = Arc::new(parking_lot::Mutex::new(SharedSplitState::Unopened(
                     UnopenedShared {
@@ -291,7 +280,6 @@ impl Stream {
                         mux,
                         pending_data_tx,
                         pending_error_tx,
-                        open_in_progress,
                         release_guard,
                     },
                 )));
@@ -315,7 +303,6 @@ impl Stream {
                 data_id,
                 data_rx,
                 error_rx,
-                mux,
                 write_tx,
                 send_window,
                 max_frame_size,
@@ -326,7 +313,6 @@ impl Stream {
             } => {
                 let opened = OpenedShared {
                     data_id,
-                    mux,
                     write_tx,
                     send_window,
                     graceful_shutdown,
@@ -439,10 +425,28 @@ fn poll_fill_buf_channel<'a>(
 /// Send DATA+FIN on a fully opened stream and mark the guard graceful so
 /// `Drop` skips RST_STREAM for the data half.
 fn poll_shutdown_opened(
-    graceful_shutdown: &AtomicBool, mux: &MuxHandle, data_id: u32,
+    graceful_shutdown: &AtomicBool, write_tx: &mut PollSender<MuxCommand>, data_id: u32,
+    cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
+    if graceful_shutdown.load(Ordering::Acquire) {
+        return Poll::Ready(Ok(()));
+    }
+    match write_tx.poll_reserve(cx) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(_)) => return Poll::Ready(Err(broken_pipe())),
+        Poll::Ready(Ok(())) => {}
+    }
+    if write_tx
+        .send_item(MuxCommand::SendData {
+            stream_id: data_id,
+            payload: Bytes::new(),
+            fin: true,
+        })
+        .is_err()
+    {
+        return Poll::Ready(Err(broken_pipe()));
+    }
     graceful_shutdown.store(true, Ordering::Release);
-    let _ = mux.send_data_nonblocking(data_id, Bytes::new(), true);
     Poll::Ready(Ok(()))
 }
 
@@ -534,90 +538,96 @@ fn poll_write_via_sender(
     }
 }
 
-/// Borrowed arguments for [`poll_lazy_open`]. Bundles the per-stream lazy
-/// state into one borrow so the function signature stays under the
-/// `clippy::too_many_arguments` threshold and the call sites read as one
-/// logical unit instead of six positional arguments.
-struct LazyOpenArgs<'a> {
-    error_headers: Vec<(String, String)>,
-    data_headers: Vec<(String, String)>,
-    max_frame_size: u32,
-    mux: &'a MuxHandle,
-    pending_data_tx: &'a mut Option<mpsc::Sender<Bytes>>,
-    pending_error_tx: &'a mut Option<mpsc::Sender<Bytes>>,
-    open_in_progress: &'a mut Option<LazyOpenFuture>,
+/// Realize a stream pair's open on the wire if it hasn't happened yet.
+/// `MuxHandle::realize_stream_pair` synchronizes purely through a
+/// `parking_lot::Mutex` with no `.await` in its critical section, so this
+/// always completes within a single call — there is no in-flight future to
+/// store, poll again, or wake waiters for.
+fn ensure_realized(
+    mux: &MuxHandle, error_headers: &mut Vec<(String, String)>,
+    data_headers: &mut Vec<(String, String)>, pending_data_tx: &mut Option<mpsc::Sender<Bytes>>,
+    pending_error_tx: &mut Option<mpsc::Sender<Bytes>>,
+) -> io::Result<OpenedStreamParts> {
+    // if pending senders have already been consumed by a previous failed
+    // open try, the stream is permanently broken: nothing left to
+    // register with the workers.
+    let (Some(data_tx), Some(error_tx)) = (pending_data_tx.take(), pending_error_tx.take()) else {
+        return Err(broken_pipe());
+    };
+    mux.realize_stream_pair(
+        std::mem::take(error_headers),
+        std::mem::take(data_headers),
+        data_tx,
+        error_tx,
+    )
+    .map_err(|_| broken_pipe())
 }
 
-/// Drive the lazy-open path for the data half of a stream. On success the
-/// caller transitions `Stream` (or the split `DataStream`'s shared slot)
-/// into `Opened` state and returns the number of bytes accepted from `buf`.
-///
-/// Returns:
-/// - `Ready(Ok(n))` if open completed and `n` bytes were committed to the
-///   atomic open+write batch (the bytes are owned by the writer now).
-/// - `Pending` if the realize future hasn't completed yet.
-/// - `Ready(Err(_))` on fatal mux error.
-///
-/// The first payload is capped to one SPDY DATA frame (`max_frame_size - 8`)
-/// because `SpdyCodec::encode_data` doesn't split. Anything beyond that in
-/// the caller's first `write_all()` lands in subsequent normal `poll_write`
-/// calls on the `Opened` state.
-fn poll_lazy_open(
-    args: LazyOpenArgs<'_>, cx: &mut Context<'_>, buf: &[u8],
-) -> Poll<io::Result<(OpenedStreamParts, usize)>> {
-    let LazyOpenArgs {
-        error_headers,
-        data_headers,
-        max_frame_size,
+fn finish_unopened_stream(this: &mut Stream, parts: OpenedStreamParts) {
+    let old = std::mem::replace(&mut this.state, StreamState::Transitioning);
+    let StreamState::Unopened {
         mux,
-        pending_data_tx,
-        pending_error_tx,
-        open_in_progress,
-    } = args;
-    if open_in_progress.is_none() {
-        // if pending senders have been consumed by a previous failed open
-        // try, the stream is permanently broken: nothing left to
-        // register with the workers.
-        let (Some(data_tx), Some(error_tx)) = (pending_data_tx.take(), pending_error_tx.take())
-        else {
-            return Poll::Ready(Err(broken_pipe()));
-        };
-        let max_payload = (max_frame_size as usize).saturating_sub(8).max(1);
-        let n = buf.len().min(max_payload);
-        // clone the first chunk so the future is cancellation-safe: if this
-        // poll returns Pending the next poll re-uses the same payload, and
-        // if the future is dropped the caller never sees the bytes as
-        // committed.
-        let first_payload = Bytes::copy_from_slice(&buf[..n]);
-        let mux_clone = mux.clone();
-        let fut = async move {
-            mux_clone
-                .realize_stream_pair(
-                    error_headers,
-                    data_headers,
-                    first_payload,
-                    data_tx,
-                    error_tx,
-                )
-                .await
-        };
-        *open_in_progress = Some(Box::pin(fut));
+        data_rx,
+        error_rx,
+        max_frame_size,
+        read_buf,
+        read_eof,
+        mut release_guard,
+        ..
+    } = old
+    else {
+        unreachable!()
+    };
+    if let Some(g) = release_guard.as_mut() {
+        g.disarm();
     }
+    let graceful_shutdown = Arc::new(AtomicBool::new(false));
+    let guard = StreamGuard {
+        data_id: parts.data_id,
+        error_id: parts.error_id,
+        mux: mux.clone(),
+        ctrl_permit_error: Some(parts.ctrl_permit_error),
+        ctrl_permit_data: Some(parts.ctrl_permit_data),
+        close_reg_permit_error: Some(parts.close_reg_permit_error),
+        close_reg_permit_data: Some(parts.close_reg_permit_data),
+        graceful_shutdown: Arc::clone(&graceful_shutdown),
+    };
+    let write_tx = PollSender::new(mux.cmd_sender());
+    this.state = StreamState::Opened {
+        data_id: parts.data_id,
+        data_rx,
+        error_rx,
+        write_tx,
+        send_window: parts.send_window,
+        max_frame_size,
+        read_buf,
+        read_eof,
+        graceful_shutdown,
+        guard,
+    };
+    drop(release_guard);
+}
 
-    let fut = open_in_progress.as_mut().expect("future just inserted");
-    match fut.as_mut().poll(cx) {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(parts)) => {
-            *open_in_progress = None;
-            let max_payload = (max_frame_size as usize).saturating_sub(8).max(1);
-            let n = buf.len().min(max_payload);
-            Poll::Ready(Ok((parts, n)))
-        }
-        Poll::Ready(Err(_)) => {
-            *open_in_progress = None;
-            Poll::Ready(Err(broken_pipe()))
-        }
-    }
+fn ensure_open(this: &mut Stream) -> io::Result<()> {
+    let parts = match &mut this.state {
+        StreamState::Unopened {
+            error_headers,
+            data_headers,
+            mux,
+            pending_data_tx,
+            pending_error_tx,
+            ..
+        } => ensure_realized(
+            mux,
+            error_headers,
+            data_headers,
+            pending_data_tx,
+            pending_error_tx,
+        )?,
+        _ => return Ok(()),
+    };
+    finish_unopened_stream(this, parts);
+    Ok(())
 }
 
 impl AsyncRead for Stream {
@@ -625,20 +635,20 @@ impl AsyncRead for Stream {
         self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Err(e) = ensure_open(this) {
+            return Poll::Ready(Err(e));
+        }
         match &mut this.state {
-            StreamState::Unopened {
-                data_rx,
-                read_buf,
-                read_eof,
-                ..
-            } => poll_read_channel(data_rx, read_buf, read_eof, cx, buf),
             StreamState::Opened {
                 data_rx,
                 read_buf,
                 read_eof,
                 ..
             } => poll_read_channel(data_rx, read_buf, read_eof, cx, buf),
-            StreamState::Transitioning => unreachable!(),
+            StreamState::Unopened { .. } | StreamState::Transitioning => unreachable!(),
         }
     }
 }
@@ -646,20 +656,17 @@ impl AsyncRead for Stream {
 impl AsyncBufRead for Stream {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
+        if let Err(e) = ensure_open(this) {
+            return Poll::Ready(Err(e));
+        }
         match &mut this.state {
-            StreamState::Unopened {
-                data_rx,
-                read_buf,
-                read_eof,
-                ..
-            } => poll_fill_buf_channel(data_rx, read_buf, read_eof, cx),
             StreamState::Opened {
                 data_rx,
                 read_buf,
                 read_eof,
                 ..
             } => poll_fill_buf_channel(data_rx, read_buf, read_eof, cx),
-            StreamState::Transitioning => unreachable!(),
+            StreamState::Unopened { .. } | StreamState::Transitioning => unreachable!(),
         }
     }
 
@@ -684,89 +691,8 @@ impl AsyncWrite for Stream {
             return Poll::Ready(Ok(0));
         }
 
-        // drive lazy open if needed. We borrow the Unopened state directly,
-        // then transition by replacing `state` with the new `Opened` value.
-        if matches!(this.state, StreamState::Unopened { .. }) {
-            // extract the fields we need to drive the future without moving
-            // the receivers (they stay borrowed by the state).
-            let (parts, n_consumed) = match &mut this.state {
-                StreamState::Unopened {
-                    error_headers,
-                    data_headers,
-                    mux,
-                    pending_data_tx,
-                    pending_error_tx,
-                    open_in_progress,
-                    max_frame_size,
-                    ..
-                } => match poll_lazy_open(
-                    LazyOpenArgs {
-                        error_headers: std::mem::take(error_headers),
-                        data_headers: std::mem::take(data_headers),
-                        max_frame_size: *max_frame_size,
-                        mux,
-                        pending_data_tx,
-                        pending_error_tx,
-                        open_in_progress,
-                    },
-                    cx,
-                    buf,
-                ) {
-                    Poll::Ready(Ok(v)) => v,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                _ => unreachable!(),
-            };
-
-            // transition Unopened -> Opened, transferring ownership of the
-            // active_pairs slot from the release guard into the StreamGuard.
-            let old = std::mem::replace(&mut this.state, StreamState::Transitioning);
-            let StreamState::Unopened {
-                mux,
-                data_rx,
-                error_rx,
-                max_frame_size,
-                read_buf,
-                read_eof,
-                mut release_guard,
-                ..
-            } = old
-            else {
-                unreachable!()
-            };
-            if let Some(g) = release_guard.as_mut() {
-                g.disarm();
-            }
-
-            let graceful_shutdown = Arc::new(AtomicBool::new(false));
-            let guard = StreamGuard {
-                data_id: parts.data_id,
-                error_id: parts.error_id,
-                mux: mux.clone(),
-                ctrl_permit_error: Some(parts.ctrl_permit_error),
-                ctrl_permit_data: Some(parts.ctrl_permit_data),
-                close_reg_permit_error: Some(parts.close_reg_permit_error),
-                close_reg_permit_data: Some(parts.close_reg_permit_data),
-                graceful_shutdown: Arc::clone(&graceful_shutdown),
-            };
-            let write_tx = PollSender::new(mux.cmd_sender());
-            this.state = StreamState::Opened {
-                data_id: parts.data_id,
-                data_rx,
-                error_rx,
-                mux,
-                write_tx,
-                send_window: parts.send_window,
-                max_frame_size,
-                read_buf,
-                read_eof,
-                graceful_shutdown,
-                guard,
-            };
-            // drop the disarmed release guard explicitly.
-            drop(release_guard);
-            return Poll::Ready(Ok(n_consumed));
+        if let Err(e) = ensure_open(this) {
+            return Poll::Ready(Err(e));
         }
 
         match &mut this.state {
@@ -775,8 +701,14 @@ impl AsyncWrite for Stream {
                 write_tx,
                 send_window,
                 max_frame_size,
+                graceful_shutdown,
                 ..
-            } => poll_write_via_sender(write_tx, *data_id, send_window, *max_frame_size, cx, buf),
+            } => {
+                if graceful_shutdown.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(broken_pipe()));
+                }
+                poll_write_via_sender(write_tx, *data_id, send_window, *max_frame_size, cx, buf)
+            }
             StreamState::Unopened { .. } => unreachable!("handled above"),
             StreamState::Transitioning => unreachable!(),
         }
@@ -786,7 +718,7 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         match &mut this.state {
             // Unopened: no SPDY stream exists yet. There is nothing on the
@@ -795,10 +727,10 @@ impl AsyncWrite for Stream {
             StreamState::Unopened { .. } => Poll::Ready(Ok(())),
             StreamState::Opened {
                 graceful_shutdown,
-                mux,
+                write_tx,
                 data_id,
                 ..
-            } => poll_shutdown_opened(graceful_shutdown, mux, *data_id),
+            } => poll_shutdown_opened(graceful_shutdown, write_tx, *data_id, cx),
             StreamState::Transitioning => unreachable!(),
         }
     }
@@ -822,13 +754,11 @@ struct UnopenedShared {
     mux: MuxHandle,
     pending_data_tx: Option<mpsc::Sender<Bytes>>,
     pending_error_tx: Option<mpsc::Sender<Bytes>>,
-    open_in_progress: Option<LazyOpenFuture>,
     release_guard: Option<PairReleaseGuard>,
 }
 
 struct OpenedShared {
     data_id: u32,
-    mux: MuxHandle,
     write_tx: PollSender<MuxCommand>,
     send_window: Arc<SendWindow>,
     graceful_shutdown: Arc<AtomicBool>,
@@ -838,8 +768,55 @@ struct OpenedShared {
     guard: StreamGuard,
 }
 
+fn finish_shared_open(guard: &mut SharedSplitState, parts: OpenedStreamParts) {
+    let old = std::mem::replace(guard, SharedSplitState::Transitioning);
+    let SharedSplitState::Unopened(mut u) = old else {
+        unreachable!()
+    };
+    if let Some(g) = u.release_guard.as_mut() {
+        g.disarm();
+    }
+    let graceful_shutdown = Arc::new(AtomicBool::new(false));
+    let stream_guard = StreamGuard {
+        data_id: parts.data_id,
+        error_id: parts.error_id,
+        mux: u.mux.clone(),
+        ctrl_permit_error: Some(parts.ctrl_permit_error),
+        ctrl_permit_data: Some(parts.ctrl_permit_data),
+        close_reg_permit_error: Some(parts.close_reg_permit_error),
+        close_reg_permit_data: Some(parts.close_reg_permit_data),
+        graceful_shutdown: Arc::clone(&graceful_shutdown),
+    };
+    let write_tx = PollSender::new(u.mux.cmd_sender());
+    *guard = SharedSplitState::Opened(OpenedShared {
+        data_id: parts.data_id,
+        write_tx,
+        send_window: parts.send_window,
+        graceful_shutdown,
+        guard: stream_guard,
+    });
+    drop(u.release_guard);
+}
+
+fn ensure_shared_open(shared: &parking_lot::Mutex<SharedSplitState>) -> io::Result<()> {
+    let mut guard = shared.lock();
+    let parts = match &mut *guard {
+        SharedSplitState::Unopened(u) => ensure_realized(
+            &u.mux,
+            &mut u.error_headers,
+            &mut u.data_headers,
+            &mut u.pending_data_tx,
+            &mut u.pending_error_tx,
+        )?,
+        _ => return Ok(()),
+    };
+    finish_shared_open(&mut guard, parts);
+    Ok(())
+}
+
 /// Data half of a split SPDY stream: AsyncRead (from pod) + AsyncWrite (to
-/// pod). Lazy open fires on the first non-empty write through this half.
+/// pod). Lazy open fires on the first non-empty write, or the first real
+/// read, through this half.
 pub struct DataStream {
     data_rx: mpsc::Receiver<Bytes>,
     max_frame_size: u32,
@@ -855,6 +832,12 @@ impl AsyncRead for DataStream {
         self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Err(e) = ensure_shared_open(&this.shared) {
+            return Poll::Ready(Err(e));
+        }
         poll_read_channel(
             &mut this.data_rx,
             &mut this.read_buf,
@@ -868,6 +851,9 @@ impl AsyncRead for DataStream {
 impl AsyncBufRead for DataStream {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
+        if let Err(e) = ensure_shared_open(&this.shared) {
+            return Poll::Ready(Err(e));
+        }
         poll_fill_buf_channel(
             &mut this.data_rx,
             &mut this.read_buf,
@@ -889,66 +875,24 @@ impl AsyncWrite for DataStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let mut guard = this.shared.lock();
-        if let SharedSplitState::Unopened(u) = &mut *guard {
-            let res = poll_lazy_open(
-                LazyOpenArgs {
-                    error_headers: std::mem::take(&mut u.error_headers),
-                    data_headers: std::mem::take(&mut u.data_headers),
-                    max_frame_size: this.max_frame_size,
-                    mux: &u.mux,
-                    pending_data_tx: &mut u.pending_data_tx,
-                    pending_error_tx: &mut u.pending_error_tx,
-                    open_in_progress: &mut u.open_in_progress,
-                },
-                cx,
-                buf,
-            );
-            match res {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok((parts, n_consumed))) => {
-                    let old = std::mem::replace(&mut *guard, SharedSplitState::Transitioning);
-                    let SharedSplitState::Unopened(mut u) = old else {
-                        unreachable!()
-                    };
-                    if let Some(g) = u.release_guard.as_mut() {
-                        g.disarm();
-                    }
-                    let graceful_shutdown = Arc::new(AtomicBool::new(false));
-                    let stream_guard = StreamGuard {
-                        data_id: parts.data_id,
-                        error_id: parts.error_id,
-                        mux: u.mux.clone(),
-                        ctrl_permit_error: Some(parts.ctrl_permit_error),
-                        ctrl_permit_data: Some(parts.ctrl_permit_data),
-                        close_reg_permit_error: Some(parts.close_reg_permit_error),
-                        close_reg_permit_data: Some(parts.close_reg_permit_data),
-                        graceful_shutdown: Arc::clone(&graceful_shutdown),
-                    };
-                    let write_tx = PollSender::new(u.mux.cmd_sender());
-                    *guard = SharedSplitState::Opened(OpenedShared {
-                        data_id: parts.data_id,
-                        mux: u.mux,
-                        write_tx,
-                        send_window: parts.send_window,
-                        graceful_shutdown,
-                        guard: stream_guard,
-                    });
-                    drop(u.release_guard);
-                    return Poll::Ready(Ok(n_consumed));
-                }
-            }
+        if let Err(e) = ensure_shared_open(&this.shared) {
+            return Poll::Ready(Err(e));
         }
+        let mut guard = this.shared.lock();
         match &mut *guard {
-            SharedSplitState::Opened(o) => poll_write_via_sender(
-                &mut o.write_tx,
-                o.data_id,
-                &o.send_window,
-                this.max_frame_size,
-                cx,
-                buf,
-            ),
+            SharedSplitState::Opened(o) => {
+                if o.graceful_shutdown.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(broken_pipe()));
+                }
+                poll_write_via_sender(
+                    &mut o.write_tx,
+                    o.data_id,
+                    &o.send_window,
+                    this.max_frame_size,
+                    cx,
+                    buf,
+                )
+            }
             SharedSplitState::Unopened(_) => unreachable!("handled above"),
             SharedSplitState::Transitioning => unreachable!(),
         }
@@ -958,13 +902,13 @@ impl AsyncWrite for DataStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let guard = this.shared.lock();
-        match &*guard {
+        let mut guard = this.shared.lock();
+        match &mut *guard {
             SharedSplitState::Unopened(_) => Poll::Ready(Ok(())),
             SharedSplitState::Opened(o) => {
-                poll_shutdown_opened(&o.graceful_shutdown, &o.mux, o.data_id)
+                poll_shutdown_opened(&o.graceful_shutdown, &mut o.write_tx, o.data_id, cx)
             }
             SharedSplitState::Transitioning => unreachable!(),
         }
@@ -972,11 +916,11 @@ impl AsyncWrite for DataStream {
 }
 
 /// Error half of a split SPDY stream: AsyncRead only (pod error messages).
+/// A read through this half can also trigger the shared lazy open.
 pub struct ErrorStream {
     error_rx: mpsc::Receiver<Bytes>,
     error_buf: Option<Bytes>,
     error_eof: bool,
-    #[allow(dead_code)] // kept alive so the shared open-state and guard outlive both halves
     shared: Arc<parking_lot::Mutex<SharedSplitState>>,
 }
 
@@ -987,6 +931,12 @@ impl AsyncRead for ErrorStream {
         self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Err(e) = ensure_shared_open(&this.shared) {
+            return Poll::Ready(Err(e));
+        }
         poll_read_channel(
             &mut this.error_rx,
             &mut this.error_buf,
@@ -994,5 +944,714 @@ impl AsyncRead for ErrorStream {
             cx,
             buf,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::DuplexStream;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::codec::Frame;
+    use crate::codec::SpdyCodec;
+    use crate::mux::MuxConfig;
+    use crate::transport::split_raw_spdy;
+
+    const TEST_MAX_FRAME: u32 = 1024 * 1024;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_config() -> MuxConfig {
+        MuxConfig {
+            ping_timeout: TEST_TIMEOUT,
+            write_timeout: TEST_TIMEOUT,
+            ..MuxConfig::default()
+        }
+    }
+
+    struct TestPeer {
+        events: mpsc::UnboundedReceiver<Frame>,
+        cmds: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl TestPeer {
+        async fn recv(&mut self) -> Frame {
+            tokio::time::timeout(TEST_TIMEOUT, self.events.recv())
+                .await
+                .expect("timed out waiting for a frame from the client")
+                .expect("peer event channel closed")
+        }
+
+        async fn recv_syn_stream(&mut self) -> u32 {
+            match self.recv().await {
+                Frame::SynStream { stream_id, .. } => stream_id,
+                other => panic!("expected SynStream, got {other:?}"),
+            }
+        }
+
+        fn send_data(&self, stream_id: u32, payload: &[u8], fin: bool) {
+            let codec = SpdyCodec::with_max_frame_size(TEST_MAX_FRAME);
+            let frame = codec.encode_data(stream_id, payload, fin);
+            self.cmds.send(frame).expect("peer task still running");
+        }
+    }
+
+    async fn run_test_peer(
+        server: DuplexStream, event_tx: mpsc::UnboundedSender<Frame>,
+        mut cmd_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (mut read_half, mut write_half) = tokio::io::split(server);
+        let mut codec = SpdyCodec::with_max_frame_size(TEST_MAX_FRAME);
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        let mut chunk = [0u8; 4096];
+        loop {
+            tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(bytes) => {
+                            if write_half.write_all(&bytes).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+                n = read_half.read(&mut chunk) => {
+                    let n = match n {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    loop {
+                        match codec.decode_frame(&mut buf) {
+                            Ok(Some(frame)) => {
+                                if let Frame::Ping { id } = &frame {
+                                    let pong = codec.encode_ping(*id);
+                                    if write_half.write_all(&pong).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if matches!(frame, Frame::Settings { .. } | Frame::WindowUpdate { stream_id: 0, .. }) {
+                                    continue;
+                                }
+                                if event_tx.send(frame).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => return,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn spawn_test_peer(config: MuxConfig) -> (MuxHandle, TestPeer) {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (ws_write, ws_read) = split_raw_spdy(client);
+        let cancel = CancellationToken::new();
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(run_test_peer(server, event_tx, cmd_rx));
+
+        let mux = MuxHandle::spawn(ws_write, ws_read, cancel, config)
+            .await
+            .expect("mux handshake");
+        (
+            mux,
+            TestPeer {
+                events: event_rx,
+                cmds: cmd_tx,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn server_first_read_wakes_unsplit_stream_without_client_write() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        let mut buf = [0u8; 16];
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id,
+                    payload,
+                    fin,
+                } => {
+                    assert_eq!(stream_id, error_id);
+                    assert!(payload.is_empty());
+                    assert!(fin);
+                }
+                other => panic!("expected error half-close DATA+FIN, got {other:?}"),
+            }
+            peer.send_data(data_id, b"hello", false);
+        };
+
+        let (read_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(stream.read(&mut buf), peer_fut)
+        })
+        .await
+        .expect("read did not complete: server-first read still blocks forever");
+
+        let n = read_result.expect("read failed");
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[tokio::test]
+    async fn server_first_fill_buf_wakes_unsplit_stream_without_client_write() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, .. } if stream_id == error_id
+            ));
+            peer.send_data(data_id, b"greeting", false);
+        };
+
+        let (data, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            let read_fut = async {
+                let bytes = stream.fill_buf().await.expect("fill_buf failed");
+                let owned = bytes.to_vec();
+                stream.consume(owned.len());
+                owned
+            };
+            tokio::join!(read_fut, peer_fut)
+        })
+        .await
+        .expect("fill_buf did not complete: server-first fill_buf still blocks forever");
+
+        assert_eq!(data, b"greeting");
+    }
+
+    #[tokio::test]
+    async fn server_first_read_wakes_split_data_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut data_stream, _error_stream) = stream.split();
+
+        let mut buf = [0u8; 16];
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, .. } if stream_id == error_id
+            ));
+            peer.send_data(data_id, b"pod-out", false);
+        };
+
+        let (read_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(data_stream.read(&mut buf), peer_fut)
+        })
+        .await
+        .expect("split DataStream read did not trigger the lazy open");
+
+        let n = read_result.expect("read failed");
+        assert_eq!(&buf[..n], b"pod-out");
+    }
+
+    #[tokio::test]
+    async fn server_first_read_wakes_split_error_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (_data_stream, mut error_stream) = stream.split();
+
+        let mut buf = [0u8; 16];
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let _data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            peer.send_data(error_id, b"pod not found", false);
+        };
+
+        let (read_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(error_stream.read(&mut buf), peer_fut)
+        })
+        .await
+        .expect("split ErrorStream read did not trigger the lazy open");
+
+        let n = read_result.expect("read failed");
+        assert_eq!(&buf[..n], b"pod not found");
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_and_write_open_the_stream_exactly_once() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut data_stream, mut error_stream) = stream.split();
+
+        let write_payload: &[u8] = b"race-safe-payload";
+        let mut err_buf = [0u8; 8];
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], write_payload);
+                }
+                other => panic!("expected the client's write payload, got {other:?}"),
+            }
+            peer.send_data(error_id, b"ack", false);
+        };
+
+        let (read_result, write_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                error_stream.read(&mut err_buf),
+                data_stream.write_all(write_payload),
+                peer_fut,
+            )
+        })
+        .await
+        .expect("concurrent read+write did not settle: possible duplicate open or hang");
+
+        let n = read_result.expect("error stream read failed");
+        assert_eq!(&err_buf[..n], b"ack");
+        write_result.expect("write_all failed");
+    }
+
+    #[tokio::test]
+    async fn unused_unopened_stream_never_opens_and_releases_capacity() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        assert_eq!(mux.active_pairs(), 0);
+
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        assert_eq!(mux.active_pairs(), 1);
+
+        drop(stream);
+        assert_eq!(mux.active_pairs(), 0);
+
+        let saw_nothing = tokio::time::timeout(Duration::from_millis(200), peer.recv())
+            .await
+            .is_err();
+        assert!(
+            saw_nothing,
+            "an unused, dropped stream must never send SYN_STREAM"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_after_read_triggered_open_sends_rst() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            (peer, data_id)
+        };
+
+        let mut buf = [0u8; 4];
+        let read_fut = stream.read(&mut buf);
+        let (mut peer, data_id) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = read_fut => panic!("read resolved without a greeting from the peer"),
+                result = peer_fut => result,
+            }
+        })
+        .await
+        .expect("open via read did not complete before the timeout");
+
+        drop(stream);
+
+        match tokio::time::timeout(TEST_TIMEOUT, peer.recv())
+            .await
+            .expect("timed out waiting for RST_STREAM after drop")
+        {
+            Frame::RstStream { stream_id, status } => {
+                assert_eq!(stream_id, data_id);
+                assert_eq!(status, RST_STATUS_CANCEL);
+            }
+            other => panic!("expected RST_STREAM for the data stream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_write_after_lazy_open_is_bounded_by_frame_size() {
+        let config = MuxConfig {
+            max_frame_size: 16,
+            ..test_config()
+        };
+        let (mux, mut peer) = spawn_test_peer(config).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        let payload = b"0123456789ABCDEFGHIJ";
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], &b"01234567"[..]);
+                }
+                other => panic!("expected the first DATA frame after lazy open, got {other:?}"),
+            }
+        };
+
+        let (write_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(stream.write(payload), peer_fut)
+        })
+        .await
+        .expect("first write did not complete");
+
+        let n = write_result.expect("write failed");
+        assert_eq!(n, 8, "first write must be bounded by max_frame_size - 8");
+    }
+
+    #[tokio::test]
+    async fn tokio_io_split_write_then_read_open_stream_exactly_once() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+        let write_payload: &[u8] = b"via-tokio-split-write-first";
+        let mut read_buf = [0u8; 8];
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], write_payload);
+                }
+                other => panic!("expected the write payload exactly once, got {other:?}"),
+            }
+            peer.send_data(data_id, b"greeting", false);
+        };
+
+        let (write_result, read_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                write_half.write_all(write_payload),
+                read_half.read(&mut read_buf),
+                peer_fut,
+            )
+        })
+        .await
+        .expect("tokio::io::split write-then-read race did not settle");
+
+        write_result.expect("write_all failed");
+        let n = read_result.expect("read failed");
+        assert_eq!(&read_buf[..n], b"greeting");
+    }
+
+    #[tokio::test]
+    async fn tokio_io_split_read_then_write_open_stream_exactly_once() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+        let write_payload: &[u8] = b"via-tokio-split-read-first";
+        let mut read_buf = [0u8; 8];
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            peer.send_data(data_id, b"greeting", false);
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], write_payload);
+                }
+                other => panic!("expected the write payload exactly once, got {other:?}"),
+            }
+        };
+
+        let (read_result, write_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                read_half.read(&mut read_buf),
+                write_half.write_all(write_payload),
+                peer_fut,
+            )
+        })
+        .await
+        .expect("tokio::io::split read-then-write race did not settle");
+
+        let n = read_result.expect("read failed");
+        assert_eq!(&read_buf[..n], b"greeting");
+        write_result.expect("write_all failed");
+    }
+
+    #[tokio::test]
+    async fn write_then_read_open_split_stream_exactly_once() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut data_stream, mut error_stream) = stream.split();
+
+        let write_payload: &[u8] = b"write-branch-first";
+        let mut err_buf = [0u8; 8];
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], write_payload);
+                }
+                other => panic!("expected the client's write payload exactly once, got {other:?}"),
+            }
+            peer.send_data(error_id, b"ack", false);
+        };
+
+        let (write_result, read_result, ()) = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                data_stream.write_all(write_payload),
+                error_stream.read(&mut err_buf),
+                peer_fut,
+            )
+        })
+        .await
+        .expect("concurrent write+read did not settle: possible duplicate open or hang");
+
+        write_result.expect("write_all failed");
+        let n = read_result.expect("error stream read failed");
+        assert_eq!(&err_buf[..n], b"ack");
+    }
+
+    #[tokio::test]
+    async fn three_way_race_does_not_lose_a_wake() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (data_stream, mut error_stream) = stream.split();
+        let (mut data_read_half, mut data_write_half) = tokio::io::split(data_stream);
+
+        let write_payload: &[u8] = b"three-way-race";
+        let mut data_buf = [0u8; 8];
+        let mut err_buf = [0u8; 8];
+
+        let peer_fut = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin, .. } if stream_id == error_id && fin
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id, payload, ..
+                } => {
+                    assert_eq!(stream_id, data_id);
+                    assert_eq!(&payload[..], write_payload);
+                }
+                other => panic!("expected the write payload exactly once, got {other:?}"),
+            }
+            peer.send_data(data_id, b"pod-out", false);
+            peer.send_data(error_id, b"pod-err", false);
+        };
+
+        let (write_result, data_read_result, err_read_result, ()) =
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                tokio::join!(
+                    data_write_half.write_all(write_payload),
+                    data_read_half.read(&mut data_buf),
+                    error_stream.read(&mut err_buf),
+                    peer_fut,
+                )
+            })
+            .await
+            .expect("three-way race did not settle: a waiter lost its wakeup");
+
+        write_result.expect("write_all failed");
+        let n = data_read_result.expect("data read failed");
+        assert_eq!(&data_buf[..n], b"pod-out");
+        let n = err_read_result.expect("error read failed");
+        assert_eq!(&err_buf[..n], b"pod-err");
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_does_not_open_unsplit_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        let mut empty = [0u8; 0];
+        let n = tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut empty))
+            .await
+            .expect("zero-length read must resolve immediately")
+            .expect("zero-length read must not error");
+        assert_eq!(n, 0);
+
+        let saw_nothing = tokio::time::timeout(Duration::from_millis(200), peer.recv())
+            .await
+            .is_err();
+        assert!(
+            saw_nothing,
+            "a zero-length read must never trigger SYN_STREAM"
+        );
+        assert_eq!(
+            mux.active_pairs(),
+            1,
+            "the reserved pair stays unopened, not released"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_does_not_open_split_data_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let (mut data_stream, _error_stream) = stream.split();
+
+        let mut empty = [0u8; 0];
+        let n = tokio::time::timeout(TEST_TIMEOUT, data_stream.read(&mut empty))
+            .await
+            .expect("zero-length read must resolve immediately")
+            .expect("zero-length read must not error");
+        assert_eq!(n, 0);
+
+        let saw_nothing = tokio::time::timeout(Duration::from_millis(200), peer.recv())
+            .await
+            .is_err();
+        assert!(
+            saw_nothing,
+            "a zero-length read on the split data half must never trigger SYN_STREAM"
+        );
+        assert_eq!(mux.active_pairs(), 1);
+    }
+
+    async fn exercise_write_shutdown(
+        mut stream: impl AsyncRead + AsyncWrite + Unpin, peer: &mut TestPeer,
+    ) {
+        let request = b"request-before-fin".repeat(128);
+        let reply = b"response-after-fin".repeat(128);
+        let client = async {
+            stream.write_all(&request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert_eq!(
+                stream.write(b"not-sent").await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, reply);
+        };
+        let server = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin: true, .. } if stream_id == error_id
+            ));
+            let mut received = Vec::new();
+            loop {
+                match peer.recv().await {
+                    Frame::Data {
+                        stream_id,
+                        payload,
+                        fin,
+                    } if stream_id == data_id => {
+                        received.extend_from_slice(&payload);
+                        if fin {
+                            break;
+                        }
+                    }
+                    frame => panic!("unexpected frame before write-side FIN: {frame:?}"),
+                }
+            }
+            assert_eq!(received, request);
+            peer.send_data(data_id, &reply, true);
+        };
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(client, server);
+        })
+        .await
+        .expect("write shutdown must preserve response reads");
+    }
+
+    #[tokio::test]
+    async fn write_shutdown_preserves_unsplit_response_reads() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux.open_stream_pair(vec![], vec![]).unwrap();
+        exercise_write_shutdown(stream, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn write_shutdown_preserves_split_response_reads() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let (stream, _errors) = mux.open_stream_pair(vec![], vec![]).unwrap().split();
+        exercise_write_shutdown(stream, &mut peer).await;
     }
 }

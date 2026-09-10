@@ -18,6 +18,7 @@ use super::{
 use crate::client::Client;
 use crate::error::Error;
 use crate::pod_watch::{
+    PodReadiness,
     PodSelector,
     PodWatcher,
 };
@@ -35,6 +36,7 @@ impl Forwarder {
             cluster_url,
             namespace: namespace.into(),
             selector: None,
+            readiness: PodReadiness::default(),
             config: ForwarderConfig::default(),
             cancel: None,
             recovery_callback: None,
@@ -47,6 +49,7 @@ pub struct ForwarderBuilder {
     cluster_url: http::Uri,
     namespace: String,
     selector: Option<PodSelector>,
+    readiness: PodReadiness,
     config: ForwarderConfig,
     cancel: Option<CancellationToken>,
     recovery_callback: Option<RecoveryCallback>,
@@ -58,24 +61,16 @@ impl ForwarderBuilder {
         self
     }
 
+    /// Select which pods are targetable: `Ready` (default) requires the
+    /// pod's `Ready` condition to be `True`; `Running` accepts any
+    /// non-terminating pod in the `Running` phase.
+    pub const fn pod_readiness(mut self, readiness: PodReadiness) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
     pub const fn max_sessions(mut self, n: usize) -> Self {
         self.config.max_sessions = n;
-        self
-    }
-
-    pub const fn session_capacity(mut self, n: usize) -> Self {
-        self.config.session_capacity = n;
-        self
-    }
-
-    pub const fn keepalive(mut self, ping: Duration, watchdog: Duration) -> Self {
-        self.config.ping_interval = ping;
-        self.config.watchdog_timeout = watchdog;
-        self
-    }
-
-    pub const fn shutdown_grace(mut self, drain: Duration) -> Self {
-        self.config.shutdown_grace = drain;
         self
     }
 
@@ -107,14 +102,18 @@ impl ForwarderBuilder {
         if self.config.max_sessions == 0 {
             return Err(Error::Configuration("max_sessions must be > 0".into()));
         }
-        if self.config.session_capacity == 0 {
-            return Err(Error::Configuration("session_capacity must be > 0".into()));
-        }
         let selector = self
             .selector
             .ok_or_else(|| Error::Configuration("pod_selector is required".into()))?;
-        let pod_watcher =
-            Arc::new(PodWatcher::new(self.kube_client.clone(), &self.namespace, selector).await?);
+        let pod_watcher = Arc::new(
+            PodWatcher::new(
+                self.kube_client.clone(),
+                &self.namespace,
+                selector,
+                self.readiness,
+            )
+            .await?,
+        );
         let pf_client = Arc::new(Client::new(self.kube_client, self.cluster_url));
         let cancel = self.cancel.unwrap_or_default();
         let recovery_callback: RecoveryCallback =

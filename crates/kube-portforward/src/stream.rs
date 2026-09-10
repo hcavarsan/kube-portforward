@@ -16,18 +16,15 @@ use tokio::io::{
 
 /// port forward stream backed by one stream pair on
 /// a multiplexed connection to the apiserver. Implements
-/// `AsyncRead + AsyncWrite` on the data half. Dropping the `Stream` (or
-/// calling `poll_shutdown`) sends a SPDY FIN frame so the apiserver tears
-/// down the backing pod connection right away.
+/// `AsyncRead + AsyncWrite` on the data half. Shutting down the write
+/// half sends a SPDY FIN; dropping the stream cancels the stream pair.
 pub struct Stream {
-    inner: Box<spdy_mux::Stream>,
+    inner: spdy_mux::Stream,
 }
 
 impl Stream {
-    pub(crate) fn from_spdy(stream: spdy_mux::Stream) -> Self {
-        Self {
-            inner: Box::new(stream),
-        }
+    pub(crate) const fn from_spdy(stream: spdy_mux::Stream) -> Self {
+        Self { inner: stream }
     }
 
     /// Returns true if the remote already closed this stream's read
@@ -39,7 +36,7 @@ impl Stream {
     /// Split the stream into its data half (`AsyncRead + AsyncWrite`) and
     /// error half (`AsyncRead`-only).
     pub fn split(self) -> (DataStream, ErrorStream) {
-        let (d, e) = (*self.inner).split();
+        let (d, e) = self.inner.split();
         (DataStream { inner: d }, ErrorStream { inner: e })
     }
 }

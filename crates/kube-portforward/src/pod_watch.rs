@@ -48,6 +48,20 @@ pub enum PodSelector {
     Labels { selector: String },
 }
 
+/// Policy selecting which pods are considered targetable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PodReadiness {
+    /// Pod phase is `Running` and its `Ready` condition is `True`. Matches
+    /// the READY column kubectl shows for a pod.
+    #[default]
+    Ready,
+    /// Pod phase is `Running` and the pod is not terminating (no
+    /// `deletionTimestamp`), regardless of its `Ready` condition. Useful to
+    /// detect a pod mid-rollout before its readiness probe passes.
+    Running,
+}
+
 /// Pod lifecycle change sent to subscribers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -86,6 +100,7 @@ pub struct PodWatcher {
     reflector_task: JoinHandle<()>,
     subscriber_task: JoinHandle<()>,
     cancel: CancellationToken,
+    readiness: PodReadiness,
 }
 
 impl Drop for PodWatcher {
@@ -99,7 +114,7 @@ impl Drop for PodWatcher {
 impl PodWatcher {
     /// Start a watcher against `namespace` selecting pods by `selector`.
     pub fn new(
-        client: kube::Client, namespace: &str, selector: PodSelector,
+        client: kube::Client, namespace: &str, selector: PodSelector, readiness: PodReadiness,
     ) -> impl Future<Output = Result<Self, Error>> {
         futures::future::lazy(move |_| {
             let label_expr = match &selector {
@@ -178,6 +193,7 @@ impl PodWatcher {
             let subscriber_latest = Arc::clone(&latest_ready);
             let subscriber_change_tx = change_tx.clone();
             let subscriber_selector = selector.clone();
+            let subscriber_readiness = readiness;
             let subscriber_handle = subscriber.clone();
             let subscriber_task = tokio::spawn(async move {
                 let mut stream = std::pin::pin!(subscriber_handle);
@@ -191,6 +207,7 @@ impl PodWatcher {
                                     &subscriber_latest,
                                     &pod,
                                     &subscriber_selector,
+                                    subscriber_readiness,
                                     &subscriber_change_tx,
                                 );
                             }
@@ -209,6 +226,7 @@ impl PodWatcher {
                 reflector_task,
                 subscriber_task,
                 cancel,
+                readiness,
             })
         })
     }
@@ -219,12 +237,11 @@ impl PodWatcher {
         let mut first_ready: Option<ReadyPod> = None;
 
         for pod in self.store.state() {
-            if !is_pod_ready(&pod, &self.selector) {
+            if !is_pod_selected(&pod, &self.selector, self.readiness) {
                 continue;
             }
-            // if the cached pod is still ready, return it directly
-            if let Some(ref c) = cached {
-                if pod.name_any() == c.name {
+            if let Some(c) = &cached {
+                if pod.name_any() == c.name && pod.metadata.uid.as_deref() == c.uid.as_deref() {
                     return Some((**c).clone());
                 }
             }
@@ -252,21 +269,25 @@ impl PodWatcher {
     /// Wait until a ready pod shows up or `timeout` elapses.
     /// Wakes on `PodChange` events instead of polling.
     pub async fn wait_for_ready_pod(&self, timeout: Duration) -> Option<ReadyPod> {
+        let mut rx = self.subscribe();
+        if self.cancel.is_cancelled() {
+            return None;
+        }
         if let Some(pod) = self.ready_pod() {
             return Some(pod);
         }
 
-        let mut rx = self.subscribe();
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 biased;
+                () = self.cancel.cancelled() => return None,
                 () = &mut deadline => return None,
                 ev = rx.recv() => {
                     match ev {
-                        Ok(PodChange::Ready(_)) => {
+                        Ok(PodChange::Ready(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
                             if let Some(pod) = self.ready_pod() {
                                 return Some(pod);
                             }
@@ -289,29 +310,41 @@ impl PodWatcher {
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
+
+    /// Whether a selected pod is currently in the `Running` phase and not
+    /// terminating, regardless of the watcher's configured
+    /// [`PodReadiness`] policy. Useful to detect a pending rollout (new
+    /// pod up but not yet passing its readiness probe) even when the
+    /// watcher itself is configured with [`PodReadiness::Ready`].
+    pub fn has_running_pods(&self) -> bool {
+        self.store
+            .state()
+            .into_iter()
+            .any(|pod| is_pod_selected(&pod, &self.selector, PodReadiness::Running))
+    }
 }
 
 fn update_latest(
     latest: &Arc<ArcSwapOption<ReadyPod>>, pod: &Pod, selector: &PodSelector,
-    change_tx: &broadcast::Sender<PodChange>,
+    readiness: PodReadiness, change_tx: &broadcast::Sender<PodChange>,
 ) {
-    if !is_pod_ready(pod, selector) {
+    if !is_pod_selected(pod, selector, readiness) {
         return;
     }
 
     let name = pod.name_any();
+    let uid = pod.metadata.uid.clone();
 
-    // check whether the pod actually changed before allocating
     let prev = latest.load();
     let changed = match prev.as_deref() {
-        Some(cur) => cur.name != name,
+        Some(cur) => cur.name != name || cur.uid != uid,
         None => true,
     };
 
     if changed {
         let ready = Arc::new(ReadyPod {
             name: name.clone(),
-            uid: pod.metadata.uid.clone(),
+            uid,
         });
         latest.store(Some(ready));
         debug!("pod_watch: ready pod changed to {}", name);
@@ -326,22 +359,25 @@ fn matches_selector(pod: &Pod, selector: &PodSelector) -> bool {
     }
 }
 
-fn is_pod_ready(pod: &Pod, selector: &PodSelector) -> bool {
+/// Whether `pod` matches `selector` and satisfies `readiness`.
+fn is_pod_selected(pod: &Pod, selector: &PodSelector, readiness: PodReadiness) -> bool {
     if !matches_selector(pod, selector) {
         return false;
     }
     let Some(status) = pod.status.as_ref() else {
         return false;
     };
-    let running = status.phase.as_deref() == Some("Running");
-    if !running {
+    if status.phase.as_deref() != Some("Running") {
         return false;
     }
-    status
-        .conditions
-        .as_ref()
-        .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
-        .unwrap_or(false)
+    match readiness {
+        PodReadiness::Running => pod.metadata.deletion_timestamp.is_none(),
+        PodReadiness::Ready => status
+            .conditions
+            .as_ref()
+            .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+            .unwrap_or(false),
+    }
 }
 
 #[cfg(test)]
@@ -350,14 +386,24 @@ mod tests {
         PodCondition,
         PodStatus,
     };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::jiff::Timestamp;
     use kube::api::ObjectMeta;
 
     use super::*;
 
     fn mk_pod(name: &str, ready: bool, running: bool) -> Pod {
+        mk_pod_full(name, None, ready, running, false)
+    }
+
+    fn mk_pod_full(
+        name: &str, uid: Option<&str>, ready: bool, running: bool, terminating: bool,
+    ) -> Pod {
         Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
+                uid: uid.map(str::to_string),
+                deletion_timestamp: terminating.then(|| Time(Timestamp::now())),
                 ..Default::default()
             },
             status: Some(PodStatus {
@@ -376,40 +422,135 @@ mod tests {
     #[test]
     fn ready_running_pod_is_ready_for_labels_selector() {
         let pod = mk_pod("p1", true, true);
-        assert!(is_pod_ready(
+        assert!(is_pod_selected(
             &pod,
             &PodSelector::Labels {
                 selector: "app=x".into()
-            }
+            },
+            PodReadiness::Ready,
         ));
     }
 
     #[test]
     fn not_running_pod_is_not_ready() {
         let pod = mk_pod("p1", true, false);
-        assert!(!is_pod_ready(
+        assert!(!is_pod_selected(
             &pod,
             &PodSelector::Labels {
                 selector: String::new()
-            }
+            },
+            PodReadiness::Ready,
         ));
     }
 
     #[test]
     fn name_selector_filters_by_name() {
         let pod = mk_pod("p1", true, true);
-        assert!(is_pod_ready(&pod, &PodSelector::Name("p1".into())));
-        assert!(!is_pod_ready(&pod, &PodSelector::Name("p2".into())));
+        assert!(is_pod_selected(
+            &pod,
+            &PodSelector::Name("p1".into()),
+            PodReadiness::Ready
+        ));
+        assert!(!is_pod_selected(
+            &pod,
+            &PodSelector::Name("p2".into()),
+            PodReadiness::Ready
+        ));
     }
 
     #[test]
     fn ready_condition_must_be_true() {
         let pod = mk_pod("p1", false, true);
-        assert!(!is_pod_ready(
+        assert!(!is_pod_selected(
             &pod,
             &PodSelector::Labels {
                 selector: String::new()
-            }
+            },
+            PodReadiness::Ready,
         ));
+    }
+
+    #[test]
+    fn running_policy_accepts_running_pod_without_ready_condition() {
+        let pod = mk_pod("p1", false, true);
+        assert!(is_pod_selected(
+            &pod,
+            &PodSelector::Labels {
+                selector: String::new()
+            },
+            PodReadiness::Running,
+        ));
+    }
+
+    #[test]
+    fn running_policy_rejects_non_running_pod() {
+        let pod = mk_pod("p1", true, false);
+        assert!(!is_pod_selected(
+            &pod,
+            &PodSelector::Labels {
+                selector: String::new()
+            },
+            PodReadiness::Running,
+        ));
+    }
+
+    #[test]
+    fn running_policy_rejects_terminating_pod() {
+        let pod = mk_pod_full("p1", None, true, true, true);
+        assert!(!is_pod_selected(
+            &pod,
+            &PodSelector::Labels {
+                selector: String::new()
+            },
+            PodReadiness::Running,
+        ));
+    }
+
+    #[test]
+    fn update_latest_detects_uid_replacement_of_same_named_pod() {
+        let latest: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+        let selector = PodSelector::Labels {
+            selector: String::new(),
+        };
+
+        let first = mk_pod_full("p1", Some("uid-a"), true, true, false);
+        update_latest(&latest, &first, &selector, PodReadiness::Ready, &change_tx);
+        let cached = latest.load_full().expect("first pod cached");
+        assert_eq!(cached.uid.as_deref(), Some("uid-a"));
+        assert!(matches!(change_rx.try_recv(), Ok(PodChange::Ready(name)) if name == "p1"));
+
+        // same name, new UID (e.g. a StatefulSet pod recreated during a
+        // rollout): must be treated as a change, not silently ignored.
+        let replaced = mk_pod_full("p1", Some("uid-b"), true, true, false);
+        update_latest(
+            &latest,
+            &replaced,
+            &selector,
+            PodReadiness::Ready,
+            &change_tx,
+        );
+        let cached = latest.load_full().expect("replacement pod cached");
+        assert_eq!(cached.uid.as_deref(), Some("uid-b"));
+        assert!(matches!(change_rx.try_recv(), Ok(PodChange::Ready(name)) if name == "p1"));
+    }
+
+    #[test]
+    fn update_latest_is_a_noop_for_unchanged_pod() {
+        let latest: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+        let selector = PodSelector::Labels {
+            selector: String::new(),
+        };
+
+        let pod = mk_pod_full("p1", Some("uid-a"), true, true, false);
+        update_latest(&latest, &pod, &selector, PodReadiness::Ready, &change_tx);
+        assert!(change_rx.try_recv().is_ok());
+
+        update_latest(&latest, &pod, &selector, PodReadiness::Ready, &change_tx);
+        assert!(
+            change_rx.try_recv().is_err(),
+            "no change event for an unchanged pod"
+        );
     }
 }

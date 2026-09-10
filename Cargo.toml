@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/spdy-mux", "crates/kube-portforward"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-only"
@@ -40,7 +40,6 @@ kube = { version = "4.2.0", features = [
   "openssl-tls",
   "runtime",
   "rustls-tls",
-  "ws",
 ] }
 kube-runtime = { version = "4.2.0", features = ["unstable-runtime"] }
 parking_lot = "0.12"
@@ -62,7 +61,7 @@ tokio-util = { version = "0.7.19", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
-spdy-mux = { version = "0.2", path = "crates/spdy-mux" }
+spdy-mux = { version = "0.3", path = "crates/spdy-mux" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

@@ -149,7 +149,7 @@ impl Session {
         let mut pool = Vec::with_capacity(total);
         let mut last_error = None;
         for (i, (writer, reader)) in connections.into_iter().enumerate() {
-            match MuxHandle::spawn(writer, reader, cancel.clone(), config.clone()).await {
+            match MuxHandle::spawn(writer, reader, cancel.child_token(), config.clone()).await {
                 Ok(mux) => pool.push(mux),
                 Err(e) => {
                     tracing::warn!(
@@ -349,5 +349,149 @@ impl Session {
             drop(self);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+        DuplexStream,
+        ReadHalf,
+        WriteHalf,
+    };
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::codec::SpdyCodec;
+    use crate::transport::{
+        RawSpdyReader,
+        RawSpdyWriter,
+        split_raw_spdy,
+    };
+
+    const TEST_DUPLEX_BUF: usize = 64 * 1024;
+
+    type ClientConn = (
+        RawSpdyWriter<WriteHalf<DuplexStream>>,
+        RawSpdyReader<ReadHalf<DuplexStream>>,
+    );
+
+    fn healthy_connection() -> (ClientConn, oneshot::Sender<()>) {
+        let (client_io, peer_io) = tokio::io::duplex(TEST_DUPLEX_BUF);
+        let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
+            let codec = SpdyCodec::with_max_frame_size(1024 * 1024);
+            let ping = codec.encode_ping(1);
+            if peer_write.write_all(&ping).await.is_err() {
+                return;
+            }
+            if peer_write.flush().await.is_err() {
+                return;
+            }
+            let mut buf = [0u8; 4096];
+            loop {
+                tokio::select! {
+                    _ = &mut kill_rx => break,
+                    res = peer_read.read(&mut buf) => {
+                        match res {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+        });
+        (split_raw_spdy(client_io), kill_tx)
+    }
+
+    fn dead_connection() -> ClientConn {
+        let (client_io, peer_io) = tokio::io::duplex(TEST_DUPLEX_BUF);
+        drop(peer_io);
+        split_raw_spdy(client_io)
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let start = tokio::time::Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_peer_does_not_cancel_healthy_siblings() {
+        let parent = CancellationToken::new();
+        let (conn_a, kill_a) = healthy_connection();
+        let (conn_b, _keep_b) = healthy_connection();
+
+        let session =
+            Session::with_config(vec![conn_a, conn_b], parent.clone(), MuxConfig::default())
+                .await
+                .expect("both peers should complete the initial PING handshake");
+        assert_eq!(session.pool.len(), 2);
+        assert!(!session.pool[0].is_closed());
+        assert!(!session.pool[1].is_closed());
+
+        let _ = kill_a.send(());
+
+        assert!(wait_until(|| session.pool[0].is_closed(), Duration::from_secs(2)).await);
+        assert!(!session.pool[1].is_closed());
+
+        for _ in 0..4 {
+            session
+                .open_stream_pair(Vec::new(), Vec::new())
+                .await
+                .expect("the healthy handle should still accept streams");
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_closes_all_children() {
+        let parent = CancellationToken::new();
+        let (conn_a, _keep_a) = healthy_connection();
+        let (conn_b, _keep_b) = healthy_connection();
+
+        let session =
+            Session::with_config(vec![conn_a, conn_b], parent.clone(), MuxConfig::default())
+                .await
+                .expect("both peers should complete the initial PING handshake");
+        assert!(!session.is_drained());
+
+        parent.cancel();
+
+        assert!(wait_until(|| session.is_drained(), Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn partial_initialization_retains_healthy_connections() {
+        let parent = CancellationToken::new();
+        let (healthy, _keep_alive) = healthy_connection();
+        let dead = dead_connection();
+
+        let session =
+            Session::with_config(vec![healthy, dead], parent.clone(), MuxConfig::default())
+                .await
+                .expect("the healthy connection should survive partial initialization");
+
+        assert_eq!(session.pool.len(), 1);
+        assert!(!session.is_drained());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!session.pool[0].is_closed());
+
+        session
+            .open_stream_pair(Vec::new(), Vec::new())
+            .await
+            .expect("the surviving handle should still accept streams");
     }
 }

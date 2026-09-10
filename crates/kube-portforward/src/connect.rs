@@ -273,22 +273,32 @@ pub(crate) async fn upgrade_spdy_with_fallback(
 ) -> Result<SpdyUpgraded, Error> {
     match upgrade_spdy_tunnel(kube_client, cluster_url, namespace, pod).await {
         Ok(up) => Ok(up),
-        Err(e) if should_fallback(&e) => {
+        Err(ws_err) if should_fallback(&ws_err) => {
             tracing::info!(
                 pod = %pod,
-                error = %e,
+                error = %ws_err,
                 "SPDY-over-WebSocket rejected, falling back to legacy SPDY upgrade"
             );
-            let status = if let Error::UpgradeFailed { status, .. } = &e {
-                *status
-            } else {
-                None
-            };
-            recovery_callback(RecoverySignal::UpgradeFailed {
-                status,
-                message: e.to_string(),
-            });
-            upgrade_legacy_spdy(kube_client, cluster_url, namespace, pod).await
+            match upgrade_legacy_spdy(kube_client, cluster_url, namespace, pod).await {
+                Ok(up) => Ok(up),
+                Err(fallback_err) => {
+                    let status = if let Error::UpgradeFailed { status, .. } = &fallback_err {
+                        *status
+                    } else if let Error::UpgradeFailed { status, .. } = &ws_err {
+                        *status
+                    } else {
+                        None
+                    };
+                    recovery_callback(RecoverySignal::UpgradeFailed {
+                        status,
+                        message: format!(
+                            "websocket upgrade rejected ({ws_err}); legacy fallback also failed: \
+                             {fallback_err}"
+                        ),
+                    });
+                    Err(fallback_err)
+                }
+            }
         }
         Err(e) => {
             if matches!(&e, Error::Kube(_) | Error::Network(_)) {
@@ -298,6 +308,187 @@ pub(crate) async fn upgrade_spdy_with_fallback(
                 });
             }
             Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use http::{
+        Response,
+        StatusCode,
+    };
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FallbackScenario {
+        SuccessfulFallback,
+        FailedFallback,
+    }
+
+    async fn handle_upgrade_request(
+        scenario: FallbackScenario, mut req: Request<Incoming>,
+    ) -> Result<Response<String>, Infallible> {
+        let upgrade_hdr = req
+            .headers()
+            .get(header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if upgrade_hdr == "websocket" {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(String::new())
+                .unwrap());
+        }
+
+        if upgrade_hdr == "spdy/3.1" {
+            return Ok(match scenario {
+                FallbackScenario::SuccessfulFallback => {
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        if let Ok(upgraded) = on_upgrade.await {
+                            let mut io = TokioIo::new(upgraded);
+                            let mut buf = [0u8; 1024];
+                            while matches!(io.read(&mut buf).await, Ok(n) if n > 0) {}
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                        .header(header::UPGRADE, LEGACY_SPDY_UPGRADE)
+                        .header("X-Stream-Protocol-Version", LEGACY_STREAM_PROTOCOL)
+                        .body(String::new())
+                        .unwrap()
+                }
+                FallbackScenario::FailedFallback => Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(String::new())
+                    .unwrap(),
+            });
+        }
+
+        Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(String::new())
+            .unwrap())
+    }
+
+    async fn spawn_fake_apiserver(
+        scenario: FallbackScenario,
+    ) -> (Uri, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| handle_upgrade_request(scenario, req));
+                    let _ = http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+        let uri: Uri = format!("http://{addr}")
+            .parse()
+            .expect("loopback address is a valid URI");
+        (uri, handle)
+    }
+
+    fn fake_kube_client(cluster_url: &Uri) -> kube::Client {
+        kube::Client::try_from(kube::Config::new(cluster_url.clone()))
+            .expect("build a kube::Client against a local, TLS-free apiserver")
+    }
+
+    fn recording_callback() -> (
+        RecoveryCallback,
+        Arc<crossbeam_queue::SegQueue<RecoverySignal>>,
+    ) {
+        let calls = Arc::new(crossbeam_queue::SegQueue::new());
+        let sink = Arc::clone(&calls);
+        let callback: RecoveryCallback = Arc::new(move |signal| {
+            sink.push(signal);
+        });
+        (callback, calls)
+    }
+
+    #[tokio::test]
+    async fn successful_fallback_reports_no_upgrade_failed() {
+        let (cluster_url, server) =
+            spawn_fake_apiserver(FallbackScenario::SuccessfulFallback).await;
+        let kube_client = fake_kube_client(&cluster_url);
+        let (callback, calls) = recording_callback();
+
+        let result = upgrade_spdy_with_fallback(
+            &kube_client,
+            &cluster_url,
+            "default",
+            "demo-pod",
+            &callback,
+        )
+        .await;
+        server.abort();
+
+        match result {
+            Ok(upgraded) => assert!(matches!(upgraded.protocol, Subprotocol::LegacySpdy)),
+            Err(e) => panic!("expected the legacy fallback to succeed, got: {e}"),
+        }
+        assert!(
+            calls.is_empty(),
+            "a successful fallback must not emit a recovery signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_reports_terminal_upgrade_failure_once() {
+        let (cluster_url, server) = spawn_fake_apiserver(FallbackScenario::FailedFallback).await;
+        let kube_client = fake_kube_client(&cluster_url);
+        let (callback, calls) = recording_callback();
+
+        let result = upgrade_spdy_with_fallback(
+            &kube_client,
+            &cluster_url,
+            "default",
+            "demo-pod",
+            &callback,
+        )
+        .await;
+        server.abort();
+
+        match result {
+            Ok(_) => panic!("expected both upgrade attempts to fail"),
+            Err(Error::UpgradeFailed { status, .. }) => {
+                assert_eq!(status, Some(502));
+            }
+            Err(e) => panic!("expected a terminal UpgradeFailed, got: {e}"),
+        }
+
+        assert_eq!(
+            calls.len(),
+            1,
+            "a terminal failure must emit exactly one recovery signal"
+        );
+        match calls.pop() {
+            Some(RecoverySignal::UpgradeFailed { status, .. }) => {
+                assert_eq!(status, Some(502));
+            }
+            other => panic!("unexpected recovery signal: {other:?}"),
         }
     }
 }

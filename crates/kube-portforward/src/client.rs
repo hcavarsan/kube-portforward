@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use spdy_mux::{
     split_fastws,
@@ -12,10 +11,6 @@ use crate::error::Error;
 use crate::recovery::RecoveryCallback;
 use crate::session::Session;
 use crate::subprotocol::Subprotocol;
-
-const DEFAULT_PING: Duration = Duration::from_secs(15);
-const DEFAULT_WATCHDOG: Duration = Duration::from_secs(30);
-const DEFAULT_DRAIN: Duration = Duration::from_secs(2);
 
 /// Pool size for the  multiplexer
 const DEFAULT_SPDY_POOL_SIZE: usize = 6;
@@ -47,9 +42,6 @@ impl Client {
             namespace: namespace.into(),
             pod: pod.into(),
             port,
-            ping_interval: DEFAULT_PING,
-            watchdog_timeout: DEFAULT_WATCHDOG,
-            drain_timeout: DEFAULT_DRAIN,
             cancel: None,
             recovery_callback: None,
             spdy_pool_size: DEFAULT_SPDY_POOL_SIZE,
@@ -99,36 +91,12 @@ pub struct SessionBuilder<'c> {
     namespace: String,
     pod: String,
     port: u16,
-    #[allow(dead_code)] // spdy-mux owns its own keepalive schedule
-    ping_interval: Duration,
-    #[allow(dead_code)] // spdy-mux owns its own watchdog
-    watchdog_timeout: Duration,
-    #[allow(dead_code)] // spdy-mux drains on cancel
-    drain_timeout: Duration,
     cancel: Option<CancellationToken>,
     recovery_callback: Option<RecoveryCallback>,
     spdy_pool_size: usize,
 }
 
 impl SessionBuilder<'_> {
-    /// SPDY multiplexing doesn't have a pre-allocated channel pair pool.
-    pub const fn capacity(self, _n: usize) -> Self {
-        self
-    }
-
-    /// Accepted for API stability. The  multiplexer handles its own
-    /// keepalive schedule based on idle time.
-    pub const fn keepalive(mut self, ping: Duration, watchdog: Duration) -> Self {
-        self.ping_interval = ping;
-        self.watchdog_timeout = watchdog;
-        self
-    }
-
-    pub const fn shutdown_grace(mut self, drain: Duration) -> Self {
-        self.drain_timeout = drain;
-        self
-    }
-
     pub fn cancellation_token(mut self, t: CancellationToken) -> Self {
         self.cancel = Some(t);
         self

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use kube_portforward::{
     Forwarder,
+    PodReadiness,
     PodSelector,
     RecoverySignal,
 };
@@ -55,7 +56,7 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
     println!("* kube-portforward Forwarder");
     println!("* cluster {cluster_url}");
     println!("* namespace={NAMESPACE} selector=app={POD} port={PORT}");
-    println!("* pool=2  capacity={CONCURRENT_STREAMS}  keepalive=5s/15s  grace=3s");
+    println!("* pool=2  max_sessions=2  readiness=Ready");
 
     let cancel = CancellationToken::new();
     let forwarder = Arc::new(
@@ -63,10 +64,8 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
             .pod_selector(PodSelector::Labels {
                 selector: format!("app={POD}"),
             })
+            .pod_readiness(PodReadiness::Ready)
             .max_sessions(2)
-            .session_capacity(CONCURRENT_STREAMS)
-            .keepalive(Duration::from_secs(5), Duration::from_secs(15))
-            .shutdown_grace(Duration::from_secs(3))
             .prune(Duration::from_secs(30), Duration::from_secs(120))
             .prefetch_threshold(0.75)
             .cancellation_token(cancel.clone())
@@ -74,8 +73,16 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
             .build()
             .await?,
     );
+
+    let mut pod_changes = forwarder.subscribe_pod_changes();
+    tokio::spawn(async move {
+        while let Ok(change) = pod_changes.recv().await {
+            println!("* pod change: {change:?}");
+        }
+    });
     wait_for_ready_pod(&forwarder, Duration::from_secs(30)).await?;
     println!("* target pod {:?}", forwarder.ready_pod());
+    println!("* has_running_pods={}", forwarder.has_running_pods());
 
     println!();
     println!("* phase 1: {CONCURRENT_STREAMS} multiplexed GETs over one upgrade");
@@ -94,16 +101,13 @@ async fn run(kube_client: &kube::Client, cluster_url: http::Uri) -> anyhow::Resu
     );
     fan_out(&forwarder).await?;
 
-    // graceful shutdown
+    // graceful shutdown. `shutdown` takes `&self` so it works through the
+    // shared `Arc<Forwarder>` and is safe to call more than once.
     println!();
     println!("* phase 3: cancel + graceful drain");
     cancel.cancel();
     cancel.cancelled().await;
-    Arc::try_unwrap(forwarder)
-        .ok()
-        .expect("forwarder still shared")
-        .shutdown()
-        .await?;
+    forwarder.shutdown().await?;
     println!("* shutdown complete");
     Ok(())
 }

@@ -26,7 +26,7 @@ If your peer wants single streams or a different pair convention, this crate wil
 
 No community. Nobody else is fuzz-testing Rust SPDY code. The Go reference implementation still receives security fixes in 2026 for things like header accounting and frame-length enforcement, and those bug classes apply to any SPDY/3.1 implementation. I track upstream commits.
 
-Lazy open is built in. The codec does not put SYN_STREAM on the wire until you write the first byte. The kubelet dials the upstream eagerly on SYN_STREAM, and a fast-closing target server will close the idle TCP before you ever use it. Lazy open avoids that race.
+Lazy open is built in. The codec does not put SYN_STREAM on the wire until you read or write the first byte. The kubelet dials the upstream eagerly on SYN_STREAM, and a fast-closing target server will close the idle TCP before you ever use it. Lazy open avoids that race, and applies equally to a read-first consumer waiting on a server greeting.
 
 Zlib header compression carries the CRIME attack surface. SPDY/3.1 was the original target of CVE-2012-4930. Inside a Kubernetes API server connection over TLS the risk is low, but the bug class is real.
 

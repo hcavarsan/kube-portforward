@@ -24,6 +24,9 @@ pub enum Error {
     #[error("network error: {0}")]
     Network(String),
 
+    #[error("port forwarding cancelled")]
+    Cancelled,
+
     #[error(transparent)]
     Kube(#[from] kube::Error),
 

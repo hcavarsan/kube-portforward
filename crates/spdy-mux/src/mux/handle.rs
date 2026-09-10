@@ -8,7 +8,6 @@ use std::sync::atomic::{
 
 use bytes::Bytes;
 use tokio::sync::{
-    Mutex as TokioMutex,
     mpsc,
     oneshot,
 };
@@ -77,12 +76,11 @@ pub(crate) struct MuxHandle {
     /// SYN_STREAM frames appear on the wire in monotonically-increasing
     /// stream-ID order, as required by SPDY/3.1.
     ///
-    /// The critical section is bounded by 3 local mpsc sends
-    /// (2× reg_tx + 1× cmd_tx). All channels are bounded with sufficient
-    /// capacity to make blocking under healthy operation rare. When the
-    /// worker or writer is dying, this mutex is released as the sends
-    /// fail with channel-closed errors.
-    open_seq: Arc<TokioMutex<OpenState>>,
+    /// The critical section is bounded by 3 local mpsc `try_send` calls
+    /// (2× reg_tx + 1× cmd_tx) plus 4 `try_reserve_owned` calls, all
+    /// synchronous — nothing in it ever awaits, so this is a plain
+    /// `parking_lot::Mutex` rather than a Tokio one.
+    open_seq: Arc<parking_lot::Mutex<OpenState>>,
     /// Peer's initial window size. Updated by SETTINGS frames.
     peer_initial_window: Arc<AtomicU32>,
     /// Peer's MAX_CONCURRENT_STREAMS from SETTINGS. 0 = unlimited.
@@ -181,7 +179,7 @@ impl MuxHandle {
             reg_txs: Arc::clone(&reg_txs),
             close_reg_txs: Arc::clone(&close_reg_txs),
             active_pairs: Arc::clone(&active_pairs),
-            open_seq: Arc::new(TokioMutex::new(OpenState { next_stream_id: 1 })),
+            open_seq: Arc::new(parking_lot::Mutex::new(OpenState { next_stream_id: 1 })),
             peer_initial_window: Arc::clone(&peer_initial_window),
             peer_max_concurrent: Arc::clone(&peer_max_concurrent),
             local_max_concurrent: config.max_concurrent_streams,
@@ -297,7 +295,7 @@ impl MuxHandle {
     ///
     /// Reserve a paired stream (error + data) and return a lazy `Stream`
     /// handle. Caller-supplied headers go on the wire when the consumer
-    /// actually writes its first byte.
+    /// actually writes or reads.
     ///
     /// # Lazy open contract
     ///
@@ -308,8 +306,8 @@ impl MuxHandle {
     /// - register the streams with frame workers
     /// - send any `SYN_STREAM` frame to the wire
     ///
-    /// All of that happens later, on the first non-empty `poll_write` of
-    /// the returned `Stream`, via [`MuxHandle::realize_stream_pair`].
+    /// All of that happens later, on the first non-empty `poll_write`, or
+    /// the first real read, via [`MuxHandle::realize_stream_pair`].
     ///
     /// # Why lazy
     ///
@@ -318,8 +316,8 @@ impl MuxHandle {
     /// it dials the target pod TCP port immediately). Fast-closing
     /// servers then close that idle connection within milliseconds, so
     /// any pre-opened spare stream is dead before the consumer can use
-    /// it. Lazy open emits `SYN_STREAM` and the first `DATA` atomically,
-    /// at the exact moment the consumer has something to send.
+    /// it. Lazy open emits `SYN_STREAM` atomically with the first `DATA`
+    /// when the consumer writes, or with no payload when it only reads.
     ///
     /// # Headers
     ///
@@ -389,31 +387,32 @@ impl MuxHandle {
 
     /// Realize a lazily opened stream pair on the wire.
     ///
-    /// Called from `Stream::poll_write` on the first non-empty write.
-    /// Allocates stream IDs, registers both streams with their workers,
-    /// reserves drop permits, and enqueues `OpenStreamPairAndWrite` which
-    /// emits `SYN_STREAM(error)`, `SYN_STREAM(data)`, and the first
-    /// `DATA(data, first_payload)` atomically in monotonic ID order.
+    /// Called from `Stream::poll_write` or `Stream::poll_read` (or the
+    /// split `DataStream`/`ErrorStream` equivalents) the first time either
+    /// side touches an unopened stream. Allocates stream IDs, registers
+    /// both streams with their workers, reserves drop permits, and
+    /// enqueues `OpenStreamPair`, which emits `SYN_STREAM(error)` and
+    /// `SYN_STREAM(data)` in monotonic ID order. The caller's first real
+    /// write goes out afterward through the normal write path, like every
+    /// other write.
     ///
     /// # Ordering guarantee
     ///
     /// Allocation, worker registration, drop-permit reservation, and writer
-    /// enqueue are all serialized under the per-handle `open_seq` mutex.
-    /// Because the writer command itself contains both SYNs plus the first
-    /// payload, the wire never sees frames for a stream whose `SYN_STREAM`
-    /// has not yet been emitted, and IDs are strictly monotonically
-    /// increasing on the wire.
+    /// enqueue are all serialized under the per-handle `open_seq` mutex, so
+    /// the wire never sees frames for a stream whose `SYN_STREAM` has not
+    /// yet been emitted, and IDs are strictly monotonically increasing on
+    /// the wire.
     ///
     /// # Backpressure
     ///
-    /// All channel sends use `try_send` / `try_reserve_owned` so we never
-    /// `.await` while holding `open_seq`. Backpressure surfaces as
-    /// `CapacityExhausted` / `MuxClosed` and propagates to the caller's
-    /// `poll_write` as `BrokenPipe`.
-    pub(crate) async fn realize_stream_pair(
+    /// All channel sends use `try_send` / `try_reserve_owned`, so this
+    /// function never awaits or blocks — it is not `async`. Backpressure
+    /// surfaces as `CapacityExhausted` / `MuxClosed` and propagates to the
+    /// caller's `poll_write`/`poll_read` as `BrokenPipe`.
+    pub(crate) fn realize_stream_pair(
         &self, error_headers: Vec<(String, String)>, data_headers: Vec<(String, String)>,
-        first_payload: Bytes, pending_data_tx: mpsc::Sender<Bytes>,
-        pending_error_tx: mpsc::Sender<Bytes>,
+        pending_data_tx: mpsc::Sender<Bytes>, pending_error_tx: mpsc::Sender<Bytes>,
     ) -> Result<OpenedStreamParts, Error> {
         if self.closed.is_cancelled() {
             return Err(Error::MuxClosed);
@@ -425,9 +424,9 @@ impl MuxHandle {
         // acquire sequencer for the duration of:
         //   - stream ID allocation
         //   - worker registration (2× reg_tx.try_send)
-        //   - writer enqueue (cmd_tx.try_send(OpenPortForwardAndWrite))
+        //   - writer enqueue (cmd_tx.try_send(OpenStreamPair))
         //   - permit reservation (4× try_reserve_owned)
-        let mut seq = self.open_seq.lock().await;
+        let mut seq = self.open_seq.lock();
 
         // re-check after acquiring (peer could have sent GOAWAY meanwhile).
         if self.closed.is_cancelled() {
@@ -511,31 +510,12 @@ impl MuxHandle {
             }
         }
 
-        // eagerly debit the data send window for first_payload. The wire
-        // command we're about to enqueue will emit the payload as part of
-        // the atomic open+write batch, so flow-control accounting must
-        // happen here, not in the writer.
-        if !first_payload.is_empty() && !data_send_window.consume(first_payload.len()) {
-            // should never happen on a freshly-created window with the
-            // peer's initial window size, but the API allows poisoning.
-            let _ = self
-                .close_reg_tx_for(error_id)
-                .try_send(StreamRegistration::Close {
-                    stream_id: error_id,
-                });
-            let _ = self
-                .close_reg_tx_for(data_id)
-                .try_send(StreamRegistration::Close { stream_id: data_id });
-            return Err(Error::MuxClosed);
-        }
-
-        // enqueue the atomic open+first-write command.
-        match self.cmd_tx.try_send(MuxCommand::OpenStreamPairAndWrite {
+        // enqueue the open command.
+        match self.cmd_tx.try_send(MuxCommand::OpenStreamPair {
             error_id,
             data_id,
             error_headers,
             data_headers,
-            first_payload,
         }) {
             Ok(()) => {}
             Err(e) => {
@@ -636,18 +616,6 @@ impl MuxHandle {
         let limit = self.operating_limit() as usize;
         let active = self.active_pairs.load(Ordering::Relaxed);
         limit.saturating_sub(active)
-    }
-
-    pub(crate) fn send_data_nonblocking(
-        &self, stream_id: u32, payload: Bytes, fin: bool,
-    ) -> Result<(), Error> {
-        self.cmd_tx
-            .try_send(MuxCommand::SendData {
-                stream_id,
-                payload,
-                fin,
-            })
-            .map_err(|_| Error::MuxClosed)
     }
 
     pub(crate) fn release_pair(&self) {

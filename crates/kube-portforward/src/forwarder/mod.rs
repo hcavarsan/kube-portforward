@@ -27,22 +27,22 @@ use tokio::sync::{
     Mutex as TokioMutex,
     RwLock as TokioRwLock,
     Semaphore,
+    broadcast,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
 use crate::error::Error;
-use crate::pod_watch::PodWatcher;
+use crate::pod_watch::{
+    PodChange,
+    PodWatcher,
+};
 use crate::recovery::RecoveryCallback;
 use crate::session::Session;
 use crate::stream::Stream;
 
 const DEFAULT_MAX_SESSIONS: usize = 128;
-const DEFAULT_SESSION_CAPACITY: usize = 32;
-const DEFAULT_PING: Duration = Duration::from_secs(15);
-const DEFAULT_WATCHDOG: Duration = Duration::from_secs(30);
-const DEFAULT_DRAIN: Duration = Duration::from_secs(2);
 const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PRUNE_IDLE_AGE: Duration = Duration::from_secs(60);
 const DEFAULT_PREFETCH_THRESHOLD: f32 = 0.60;
@@ -53,10 +53,6 @@ const CONNECTION_SLOT_PERMITS: usize = 50;
 #[derive(Clone, Copy)]
 struct ForwarderConfig {
     max_sessions: usize,
-    session_capacity: usize,
-    ping_interval: Duration,
-    watchdog_timeout: Duration,
-    shutdown_grace: Duration,
     prune_interval: Duration,
     prune_idle_age: Duration,
     prefetch_threshold: f32,
@@ -66,10 +62,6 @@ impl Default for ForwarderConfig {
     fn default() -> Self {
         Self {
             max_sessions: DEFAULT_MAX_SESSIONS,
-            session_capacity: DEFAULT_SESSION_CAPACITY,
-            ping_interval: DEFAULT_PING,
-            watchdog_timeout: DEFAULT_WATCHDOG,
-            shutdown_grace: DEFAULT_DRAIN,
             prune_interval: DEFAULT_PRUNE_INTERVAL,
             prune_idle_age: DEFAULT_PRUNE_IDLE_AGE,
             prefetch_threshold: DEFAULT_PREFETCH_THRESHOLD,
@@ -106,20 +98,27 @@ impl Forwarder {
     /// for a ready pod on first call. Opens new sessions on demand and
     /// retires drained ones.
     pub async fn connect(&self, target_port: u16) -> Result<Stream, Error> {
-        for _ in 0..self.config.max_sessions {
-            let session = self.ensure_session(target_port).await?;
-            match session.connect().await {
-                Ok(s) => return Ok(s),
-                // capacity exhaustion on this session means the pool is saturated;
-                // ensure_session() will pick a different one on the next iteration.
-                Err(Error::CapacityExhausted { .. }) => {}
-                Err(e) => return Err(e),
-            }
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(Error::Cancelled),
+            result = async {
+                if target_port == 0 {
+                    return Err(Error::Configuration("target port must be greater than zero".into()));
+                }
+                for _ in 0..self.config.max_sessions {
+                    let session = self.ensure_session(target_port).await?;
+                    match session.connect().await {
+                        Ok(stream) => return Ok(stream),
+                        Err(Error::CapacityExhausted { .. }) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(Error::CapacityExhausted {
+                    in_use: 0,
+                    capacity: self.config.max_sessions,
+                })
+            } => result,
         }
-        Err(Error::CapacityExhausted {
-            in_use: 0,
-            capacity: self.config.max_sessions,
-        })
     }
 
     /// Cancellation token tripped by [`Forwarder::shutdown`].
@@ -131,8 +130,25 @@ impl Forwarder {
         self.pod_watcher.ready_pod().map(|p| p.name)
     }
 
-    /// Cancel background tasks, drain all sessions.
-    pub async fn shutdown(self) -> Result<(), Error> {
+    pub async fn wait_for_ready_pod(&self, timeout: Duration) -> Option<String> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => None,
+            ready = self.pod_watcher.wait_for_ready_pod(timeout) => ready.map(|pod| pod.name),
+        }
+    }
+
+    pub fn has_running_pods(&self) -> bool {
+        self.pod_watcher.has_running_pods()
+    }
+
+    pub fn subscribe_pod_changes(&self) -> broadcast::Receiver<PodChange> {
+        self.pod_watcher.subscribe()
+    }
+
+    /// Cancel background tasks, drain all sessions. Idempotent; callable
+    /// through an `Arc<Forwarder>` shared with other owners.
+    pub async fn shutdown(&self) -> Result<(), Error> {
         self.pod_watcher.shutdown();
         self.cancel.cancel();
         self.session_cancel.cancel();
@@ -158,11 +174,59 @@ impl Forwarder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_config_sane() {
-        let c = ForwarderConfig::default();
-        assert_eq!(c.max_sessions, 128);
-        assert_eq!(c.session_capacity, 32);
-        assert!(c.prefetch_threshold > 0.0 && c.prefetch_threshold < 1.0);
+    async fn waiting_forwarder() -> (Arc<Forwarder>, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: http::Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let client = kube::Client::try_from(kube::Config::new(url.clone())).unwrap();
+        let forwarder = Forwarder::builder(client, url, "default")
+            .pod_selector(crate::PodSelector::Name("waiting".into()))
+            .build()
+            .await
+            .unwrap();
+        (Arc::new(forwarder), listener)
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_connections_and_prevents_reopening() {
+        let (forwarder, _listener) = waiting_forwarder().await;
+        let pending = forwarder.connect(8080);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        let other_owner = Arc::clone(&forwarder);
+        tokio::time::timeout(Duration::from_secs(1), other_owner.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), &mut pending)
+                .await
+                .unwrap(),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), forwarder.connect(8080))
+                .await
+                .unwrap(),
+            Err(Error::Cancelled)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), forwarder.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_target_port_fails_before_waiting_for_pods() {
+        let (forwarder, _listener) = waiting_forwarder().await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), forwarder.connect(0))
+                .await
+                .unwrap(),
+            Err(Error::Configuration(_))
+        ));
+        forwarder.shutdown().await.unwrap();
     }
 }
