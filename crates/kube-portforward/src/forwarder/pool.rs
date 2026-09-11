@@ -9,21 +9,17 @@ use quanta::Instant;
 use tokio::sync::RwLock as TokioRwLock;
 
 use super::Forwarder;
+use crate::pod_watch::ReadyPod;
 use crate::session::Session;
 
 pub(super) struct PooledSession {
     pub(super) session: Arc<Session>,
     pub(super) created_at: Instant,
-    #[expect(
-        dead_code,
-        reason = "stored for diagnostic logging and future pod-affinity checks"
-    )]
-    pub(super) pod_uid: String,
 }
 
 pub(super) struct SessionPool {
     pub(super) entries: Vec<PooledSession>,
-    pub(super) target_pod_uid: Option<String>,
+    pub(super) target: Option<ReadyPod>,
     pub(super) prefetch_in_flight: bool,
     /// Number of sessions currently being opened. Exposed as `Arc<AtomicUsize>`
     /// so [`OpeningSlot`] can decrement it on drop without needing the
@@ -40,7 +36,7 @@ impl SessionPool {
     pub(super) fn new() -> Self {
         Self {
             entries: Vec::new(),
-            target_pod_uid: None,
+            target: None,
             prefetch_in_flight: false,
             opening_count: Arc::new(AtomicUsize::new(0)),
             snapshot: Arc::new(ArcSwap::from_pointee(Vec::new())),
@@ -59,14 +55,8 @@ impl SessionPool {
         self.snapshot.store(Arc::new(sessions));
     }
 
-    /// True when there's already a session being created. Concurrent callers
-    /// should wait for it instead of opening yet another session.
-    pub(super) fn has_pending_or_available(&self) -> bool {
-        self.opening_count.load(Ordering::Relaxed) > 0
-            || self
-                .entries
-                .iter()
-                .any(|e| !e.session.cancellation_token().is_cancelled())
+    pub(super) fn has_in_flight_open(&self) -> bool {
+        self.opening_count.load(Ordering::Relaxed) > 0 || self.prefetch_in_flight
     }
 }
 
@@ -99,7 +89,7 @@ impl Drop for OpeningSlot {
 pub(super) async fn drain_and_cancel_all(sessions: &TokioRwLock<SessionPool>) {
     let drained: Vec<PooledSession> = {
         let mut pool = sessions.write().await;
-        pool.target_pod_uid = None;
+        pool.target = None;
         let drained = std::mem::take(&mut pool.entries);
         pool.refresh_snapshot();
         drained
@@ -109,55 +99,39 @@ pub(super) async fn drain_and_cancel_all(sessions: &TokioRwLock<SessionPool>) {
     }
 }
 
+pub(super) async fn install_if_current(
+    sessions: &TokioRwLock<SessionPool>, opened_for: &ReadyPod, session: Arc<Session>,
+) -> Result<Arc<Session>, Arc<Session>> {
+    let mut pool = sessions.write().await;
+    if pool.target.as_ref() == Some(opened_for) {
+        pool.entries.push(PooledSession {
+            session: Arc::clone(&session),
+            created_at: Instant::now(),
+        });
+        pool.refresh_snapshot();
+        Ok(session)
+    } else {
+        Err(session)
+    }
+}
+
 impl Forwarder {
-    /// Snapshot sessions under lock, drop the lock, then check `is_drained()`
-    /// on each. Re-acquire to swap in only alive sessions.
     pub(super) async fn retire_dead_sessions(&self) {
-        let snapshots: Vec<(Arc<Session>, bool)> = {
-            let pool = self.sessions.read().await;
-            pool.entries
-                .iter()
-                .map(|e| {
-                    (
-                        Arc::clone(&e.session),
-                        e.session.cancellation_token().is_cancelled(),
-                    )
+        let retired: Vec<_> = {
+            let mut pool = self.sessions.write().await;
+            let retired: Vec<_> = pool
+                .entries
+                .extract_if(.., |entry| {
+                    entry.session.cancellation_token().is_cancelled() || entry.session.is_drained()
                 })
-                .collect()
+                .collect();
+            if !retired.is_empty() {
+                pool.refresh_snapshot();
+            }
+            retired
         };
-
-        let mut dead_indices = Vec::new();
-        for (i, (session, cancelled)) in snapshots.iter().enumerate() {
-            if *cancelled || session.is_drained() {
-                dead_indices.push(i);
-            }
-        }
-
-        if dead_indices.is_empty() {
-            return;
-        }
-
-        let retired: Vec<Arc<Session>> = {
-            let mut write = self.sessions.write().await;
-            let mut retired_sessions = Vec::new();
-            let mut alive = Vec::with_capacity(write.entries.len());
-            for (i, entry) in write.entries.drain(..).enumerate() {
-                if dead_indices.contains(&i) {
-                    retired_sessions.push(Arc::clone(&entry.session));
-                } else {
-                    alive.push(entry);
-                }
-            }
-            write.entries = alive;
-            if write.entries.is_empty() {
-                write.target_pod_uid = None;
-            }
-            write.refresh_snapshot();
-            retired_sessions
-        };
-
-        for retired_session in retired {
-            retired_session.cancellation_token().cancel();
+        for pooled in retired {
+            pooled.session.cancellation_token().cancel();
         }
     }
 
@@ -176,7 +150,7 @@ impl Forwarder {
     }
 
     pub(super) async fn try_reuse_session(
-        &self, target_port: u16, pod_uid: &str, pod_name: &str,
+        &self, target_port: u16, ready: &ReadyPod,
     ) -> Option<Arc<Session>> {
         let snap = self.session_snap.load();
         for session in snap.iter() {
@@ -184,13 +158,7 @@ impl Forwarder {
                 let chosen = Arc::clone(session);
                 // release the snapshot guard before awaiting.
                 drop(snap);
-                self.maybe_prefetch(
-                    &chosen,
-                    target_port,
-                    pod_name.to_string(),
-                    pod_uid.to_string(),
-                )
-                .await;
+                self.maybe_prefetch(&chosen, target_port, ready).await;
                 return Some(chosen);
             }
         }
@@ -212,5 +180,102 @@ impl Forwarder {
 
     pub(super) fn next_call_id(&self) -> u64 {
         self.call_counter.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn fake_session(port: u16) -> Arc<Session> {
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    };
+
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match server.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if server.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let (ws_write, ws_read) = spdy_mux::split_raw_spdy(client);
+    let mux = spdy_mux::Session::with_config(
+        vec![(ws_write, ws_read)],
+        tokio_util::sync::CancellationToken::new(),
+        spdy_mux::MuxConfig::default(),
+    )
+    .await
+    .expect("loopback echo peer completes the initial PING handshake");
+    Arc::new(Session::from_spdy(
+        mux,
+        crate::subprotocol::Subprotocol::LegacySpdy,
+        port,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(name: &str, uid: &str) -> ReadyPod {
+        ReadyPod::new(name.into(), Some(uid.into()))
+    }
+
+    #[tokio::test]
+    async fn gate_only_blocks_on_genuine_in_flight_work() {
+        let mut pool = SessionPool::new();
+        assert!(!pool.has_in_flight_open());
+
+        let session = fake_session(8080).await;
+        pool.entries.push(PooledSession {
+            session,
+            created_at: Instant::now(),
+        });
+        pool.refresh_snapshot();
+        assert!(!pool.has_in_flight_open());
+
+        let slot = OpeningSlot::new(Arc::clone(&pool.opening_count));
+        assert!(pool.has_in_flight_open());
+        drop(slot);
+        assert!(!pool.has_in_flight_open());
+
+        pool.prefetch_in_flight = true;
+        assert!(pool.has_in_flight_open());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_a_session_opened_for_a_stale_target() {
+        let sessions = TokioRwLock::new(SessionPool::new());
+        let pod_a = ready("a", "uid-a");
+        let pod_b = ready("b", "uid-b");
+        {
+            let mut pool = sessions.write().await;
+            pool.target = Some(pod_b.clone());
+        }
+
+        let session_a = fake_session(8080).await;
+        let result = install_if_current(&sessions, &pod_a, Arc::clone(&session_a)).await;
+        assert!(
+            result.is_err(),
+            "a session opened for a target the pool already moved away from must not be installed"
+        );
+        assert!(sessions.read().await.entries.is_empty());
+
+        let session_b = fake_session(8080).await;
+        let result = install_if_current(&sessions, &pod_b, Arc::clone(&session_b)).await;
+        assert!(
+            result.is_ok(),
+            "a session opened for the still-current target must install"
+        );
+        drain_and_cancel_all(&sessions).await;
+        assert!(session_b.cancellation_token().is_cancelled());
+        assert!(!session_a.cancellation_token().is_cancelled());
+        session_a.cancellation_token().cancel();
     }
 }

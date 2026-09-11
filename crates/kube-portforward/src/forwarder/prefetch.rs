@@ -10,12 +10,13 @@ use super::pool::{
     PooledSession,
     SessionPool,
 };
+use crate::pod_watch::ReadyPod;
 use crate::recovery::RecoverySignal;
 use crate::session::Session;
 
 impl Forwarder {
     pub(super) async fn maybe_prefetch(
-        &self, session: &Arc<Session>, target_port: u16, pod_name: String, pod_uid: String,
+        &self, session: &Arc<Session>, target_port: u16, ready: &ReadyPod,
     ) {
         // replenish spare streams if below low watermark (non-blocking
         // best-effort). `replenish_spare_streams` internally guards
@@ -49,7 +50,7 @@ impl Forwarder {
             let mut pool = self.sessions.write().await;
             if pool.prefetch_in_flight
                 || pool.entries.len() >= self.config.max_sessions
-                || pool.target_pod_uid.as_deref() != Some(pod_uid.as_str())
+                || pool.target.as_ref() != Some(ready)
             {
                 return;
             }
@@ -62,12 +63,14 @@ impl Forwarder {
         let session_cancel = self.session_cancel.clone();
         let config = self.config;
         let recovery_cb = Arc::clone(&self.recovery_callback);
+        let session_ready = Arc::clone(&self.session_ready);
+        let target = ready.clone();
 
         self.background_tasks.lock().await.spawn(async move {
-            debug!("forwarder: prefetching session for pod {}", pod_name);
+            debug!("forwarder: prefetching session for pod {}", target.name);
             let cb = Arc::clone(&recovery_cb);
             let open_result = pf_client
-                .session(&*namespace, &pod_name, target_port)
+                .session(&*namespace, &target.name, target_port)
                 .cancellation_token(session_cancel.child_token())
                 .on_recovery(move |signal: RecoverySignal| (cb)(signal))
                 .open()
@@ -78,14 +81,15 @@ impl Forwarder {
             match open_result {
                 Ok(new) => {
                     let ok = pool.entries.len() < config.max_sessions
-                        && pool.target_pod_uid.as_deref() == Some(pod_uid.as_str());
+                        && pool.target.as_ref() == Some(&target);
                     if ok {
                         pool.entries.push(PooledSession {
                             session: Arc::new(new),
                             created_at: Instant::now(),
-                            pod_uid: pod_uid.clone(),
                         });
                         pool.refresh_snapshot();
+                        drop(pool);
+                        session_ready.notify_waiters();
                     } else {
                         drop(pool);
                         new.cancellation_token().cancel();
@@ -118,64 +122,24 @@ impl Forwarder {
     }
 }
 
-/// Snapshot session handles and metadata under write guard, drop it, then
-/// check `in_use()` on each outside the lock.
 async fn prune_once(sessions: &Arc<TokioRwLock<SessionPool>>, idle_age: Duration) {
-    let snapshots: Vec<(Arc<Session>, Instant, bool)> = {
-        let pool = sessions.read().await;
-        if pool.entries.is_empty() {
-            return;
-        }
-        pool.entries
-            .iter()
-            .map(|e| {
-                (
-                    Arc::clone(&e.session),
-                    e.created_at,
-                    e.session.cancellation_token().is_cancelled(),
-                )
+    let dropped: Vec<_> = {
+        let mut pool = sessions.write().await;
+        let limit = pool.entries.len().saturating_sub(1);
+        let dropped: Vec<_> = pool
+            .entries
+            .extract_if(.., |entry| {
+                entry.session.cancellation_token().is_cancelled()
+                    || (entry.session.in_use() == 0 && entry.created_at.elapsed() > idle_age)
             })
-            .collect()
-    };
-
-    let total = snapshots.len();
-    let mut idle_indices = Vec::new();
-    for (i, (session, created_at, cancelled)) in snapshots.iter().enumerate() {
-        let aged_idle = session.in_use() == 0 && created_at.elapsed() > idle_age;
-        if *cancelled || aged_idle {
-            idle_indices.push(i);
+            .take(limit)
+            .collect();
+        if !dropped.is_empty() {
+            pool.refresh_snapshot();
         }
-    }
-
-    let to_prune = if total > 1 {
-        idle_indices.len().min(total - 1)
-    } else {
-        0
+        dropped
     };
-    if to_prune == 0 {
-        return;
-    }
-
-    let mut pool = sessions.write().await;
-    // pool may have changed while we were checking in_use()
-    if pool.entries.len() != total {
-        return;
-    }
-    let prune_set: std::collections::HashSet<usize> =
-        idle_indices.into_iter().take(to_prune).collect();
-    let mut dropped = Vec::with_capacity(to_prune);
-    let mut kept = Vec::with_capacity(total - to_prune);
-    for (i, entry) in pool.entries.drain(..).enumerate() {
-        if prune_set.contains(&i) {
-            dropped.push(entry);
-        } else {
-            kept.push(entry);
-        }
-    }
-    pool.entries = kept;
-    pool.refresh_snapshot();
-    drop(pool);
-    for dropped_session in dropped {
-        dropped_session.session.cancellation_token().cancel();
+    for pooled in dropped {
+        pooled.session.cancellation_token().cancel();
     }
 }

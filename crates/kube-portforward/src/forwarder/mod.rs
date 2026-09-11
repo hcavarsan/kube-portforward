@@ -172,16 +172,19 @@ impl Forwarder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use tokio::net::TcpListener;
 
-    async fn waiting_forwarder() -> (Arc<Forwarder>, tokio::net::TcpListener) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    use super::*;
+    use crate::pod_watch::PodSelector;
+
+    async fn waiting_forwarder() -> (Arc<Forwarder>, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url: http::Uri = format!("http://{}", listener.local_addr().unwrap())
             .parse()
             .unwrap();
         let client = kube::Client::try_from(kube::Config::new(url.clone())).unwrap();
         let forwarder = Forwarder::builder(client, url, "default")
-            .pod_selector(crate::PodSelector::Name("waiting".into()))
+            .pod_selector(PodSelector::Name("waiting".into()))
             .build()
             .await
             .unwrap();

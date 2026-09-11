@@ -20,6 +20,8 @@ use http::{
     header,
 };
 use hyper::upgrade::Upgraded;
+use hyper_util::client::legacy::connect::CaptureConnection;
+use hyper_util::client::legacy::connect::capture_connection;
 use hyper_util::rt::TokioIo;
 use kube::client::Body;
 
@@ -38,6 +40,12 @@ const LEGACY_STREAM_PROTOCOL: &str = "portforward.k8s.io";
 pub(crate) struct SpdyUpgraded {
     pub upgraded: TokioIo<Upgraded>,
     pub protocol: Subprotocol,
+}
+
+fn poison_rejected_upgrade(captured: &CaptureConnection) {
+    if let Some(connected) = captured.connection_metadata().as_ref() {
+        connected.poison();
+    }
 }
 
 fn name_is_valid(s: &str) -> bool {
@@ -118,12 +126,12 @@ async fn perform_ws_upgrade(
         .headers
         .insert(header::SEC_WEBSOCKET_KEY, key.parse().unwrap());
 
-    let res = kube_client
-        .send(Request::from_parts(parts, Body::from(body)))
-        .await
-        .map_err(Error::Kube)?;
+    let mut request = Request::from_parts(parts, Body::from(body));
+    let captured = capture_connection(&mut request);
+    let res = kube_client.send(request).await.map_err(Error::Kube)?;
 
     if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        poison_rejected_upgrade(&captured);
         let status_code = res.status().as_u16();
         return Err(Error::UpgradeFailed {
             status: Some(status_code),
@@ -164,12 +172,12 @@ async fn perform_legacy_spdy_upgrade(
     kube_client: &kube::Client, request: Request<Vec<u8>>,
 ) -> Result<TokioIo<Upgraded>, Error> {
     let (parts, body) = request.into_parts();
-    let res = kube_client
-        .send(Request::from_parts(parts, Body::from(body)))
-        .await
-        .map_err(Error::Kube)?;
+    let mut request = Request::from_parts(parts, Body::from(body));
+    let captured = capture_connection(&mut request);
+    let res = kube_client.send(request).await.map_err(Error::Kube)?;
 
     if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        poison_rejected_upgrade(&captured);
         let status_code = res.status().as_u16();
         return Err(Error::UpgradeFailed {
             status: Some(status_code),
@@ -316,6 +324,9 @@ pub(crate) async fn upgrade_spdy_with_fallback(
 mod tests {
     use std::convert::Infallible;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use http::{
         Response,
@@ -325,6 +336,7 @@ mod tests {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -490,5 +502,104 @@ mod tests {
             }
             other => panic!("unexpected recovery signal: {other:?}"),
         }
+    }
+
+    async fn spawn_apiserver_that_hijacks_rejected_upgrades()
+    -> (Uri, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_loop = Arc::clone(&accepted);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted_for_loop.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                head.extend_from_slice(&chunk[..n]);
+                                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+
+                    if head.contains("upgrade: websocket") {
+                        let body = "query parameter \"port\" is required\n";
+                        let body_len = body.len();
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {body_len}\r\n\r\n{body}"
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut probe = [0u8; 1];
+                        if matches!(stream.read(&mut probe).await, Ok(n) if n > 0) {
+                            drop(stream);
+                        }
+                    } else if head.contains("upgrade: spdy/3.1") {
+                        let response = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {LEGACY_SPDY_UPGRADE}\r\nX-Stream-Protocol-Version: {LEGACY_STREAM_PROTOCOL}\r\n\r\n"
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut drain = [0u8; 1024];
+                        while matches!(stream.read(&mut drain).await, Ok(n) if n > 0) {}
+                    }
+                });
+            }
+        });
+        let uri: Uri = format!("http://{addr}")
+            .parse()
+            .expect("loopback address is a valid URI");
+        (uri, accepted, handle)
+    }
+
+    #[tokio::test]
+    async fn rejected_websocket_upgrade_connection_is_not_reused() {
+        let (cluster_url, accepted, server) =
+            spawn_apiserver_that_hijacks_rejected_upgrades().await;
+        let kube_client = fake_kube_client(&cluster_url);
+
+        let ws_request = build_spdy_tunnel_request(&cluster_url, "default", "demo-pod")
+            .expect("build websocket upgrade request");
+        let ws_err = perform_ws_upgrade(&kube_client, ws_request)
+            .await
+            .expect_err("a content-length 400 must be rejected, not treated as an upgrade");
+        assert!(matches!(
+            ws_err,
+            Error::UpgradeFailed {
+                status: Some(400),
+                ..
+            }
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let legacy_request = build_legacy_spdy_request(&cluster_url, "default", "demo-pod")
+            .expect("build legacy upgrade request");
+        let result = perform_legacy_spdy_upgrade(&kube_client, legacy_request).await;
+        server.abort();
+
+        match result {
+            Ok(upgraded) => drop(upgraded),
+            Err(e) => panic!("legacy fallback must open its own connection, got: {e}"),
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the rejected connection must not be reused for the legacy fallback"
+        );
     }
 }

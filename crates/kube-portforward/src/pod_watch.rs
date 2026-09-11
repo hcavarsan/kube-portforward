@@ -52,8 +52,8 @@ pub enum PodSelector {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PodReadiness {
-    /// Pod phase is `Running` and its `Ready` condition is `True`. Matches
-    /// the READY column kubectl shows for a pod.
+    /// Pod phase is `Running`, its `Ready` condition is `True`, and it
+    /// is not terminating (no `deletionTimestamp`).
     #[default]
     Ready,
     /// Pod phase is `Running` and the pod is not terminating (no
@@ -74,7 +74,7 @@ pub enum PodChange {
 }
 
 /// Snapshot of the currently ready pod.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReadyPod {
     pub name: String,
@@ -162,17 +162,7 @@ impl PodWatcher {
                         () = reflector_cancel.cancelled() => break,
                         next = stream.next() => match next {
                             Some(Ok(watcher::Event::Delete(pod))) => {
-                                let name = pod.name_any();
-                                let prev = reflector_latest.rcu(|cur| {
-                                    if cur.as_deref().is_some_and(|c| c.name == name) {
-                                        None
-                                    } else {
-                                        cur.clone()
-                                    }
-                                });
-                                if prev.as_deref().is_some_and(|c| c.name == name) {
-                                    let _ = reflector_change_tx.send(PodChange::Died(name));
-                                }
+                                handle_deleted_pod(&reflector_latest, &pod.name_any(), &reflector_change_tx);
                             }
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
@@ -337,7 +327,8 @@ fn update_latest(
 
     let prev = latest.load();
     let changed = match prev.as_deref() {
-        Some(cur) => cur.name != name || cur.uid != uid,
+        Some(cur) if cur.name == name => cur.uid != uid,
+        Some(_) => false,
         None => true,
     };
 
@@ -349,6 +340,21 @@ fn update_latest(
         latest.store(Some(ready));
         debug!("pod_watch: ready pod changed to {}", name);
         let _ = change_tx.send(PodChange::Ready(name));
+    }
+}
+
+fn handle_deleted_pod(
+    latest: &Arc<ArcSwapOption<ReadyPod>>, name: &str, change_tx: &broadcast::Sender<PodChange>,
+) {
+    let prev = latest.rcu(|cur| {
+        if cur.as_deref().is_some_and(|c| c.name == name) {
+            None
+        } else {
+            cur.clone()
+        }
+    });
+    if prev.as_deref().is_some_and(|c| c.name == name) {
+        let _ = change_tx.send(PodChange::Died(name.to_string()));
     }
 }
 
@@ -372,11 +378,50 @@ fn is_pod_selected(pod: &Pod, selector: &PodSelector, readiness: PodReadiness) -
     }
     match readiness {
         PodReadiness::Running => pod.metadata.deletion_timestamp.is_none(),
-        PodReadiness::Ready => status
-            .conditions
-            .as_ref()
-            .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
-            .unwrap_or(false),
+        PodReadiness::Ready => {
+            pod.metadata.deletion_timestamp.is_none()
+                && status
+                    .conditions
+                    .as_ref()
+                    .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+                    .unwrap_or(false)
+        }
+    }
+}
+
+#[cfg(test)]
+impl PodWatcher {
+    pub(crate) fn for_test(
+        selector: PodSelector, readiness: PodReadiness,
+    ) -> (Self, reflector::store::Writer<Pod>) {
+        let (store, writer) = reflector::store_shared(16);
+        let subscriber = writer
+            .subscribe()
+            .expect("a writer created via store_shared supports subscribe");
+        let (change_tx, _) = broadcast::channel(16);
+        let watcher = Self {
+            store,
+            _subscriber: subscriber,
+            latest_ready: Arc::new(ArcSwapOption::const_empty()),
+            change_tx,
+            selector,
+            reflector_task: tokio::spawn(async {}),
+            subscriber_task: tokio::spawn(async {}),
+            cancel: CancellationToken::new(),
+            readiness,
+        };
+        (watcher, writer)
+    }
+
+    pub(crate) fn test_apply(&self, writer: &mut reflector::store::Writer<Pod>, pod: &Pod) {
+        writer.apply_watcher_event(&watcher::Event::Apply(pod.clone()));
+        update_latest(
+            &self.latest_ready,
+            pod,
+            &self.selector,
+            self.readiness,
+            &self.change_tx,
+        );
     }
 }
 
@@ -552,5 +597,79 @@ mod tests {
             change_rx.try_recv().is_err(),
             "no change event for an unchanged pod"
         );
+    }
+
+    #[test]
+    fn ready_policy_rejects_terminating_pod() {
+        let pod = mk_pod_full("p1", None, true, true, true);
+        assert!(!is_pod_selected(
+            &pod,
+            &PodSelector::Labels {
+                selector: String::new()
+            },
+            PodReadiness::Ready,
+        ));
+    }
+
+    #[test]
+    fn update_latest_keeps_current_target_when_a_different_pod_becomes_ready() {
+        let latest: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+        let selector = PodSelector::Labels {
+            selector: String::new(),
+        };
+
+        let p1 = mk_pod_full("p1", Some("uid-a"), true, true, false);
+        update_latest(&latest, &p1, &selector, PodReadiness::Ready, &change_tx);
+        assert!(matches!(change_rx.try_recv(), Ok(PodChange::Ready(name)) if name == "p1"));
+
+        let p2 = mk_pod_full("p2", Some("uid-b"), true, true, false);
+        update_latest(&latest, &p2, &selector, PodReadiness::Ready, &change_tx);
+        let cached = latest.load_full().expect("cache still populated");
+        assert_eq!(cached.name, "p1");
+        assert!(
+            change_rx.try_recv().is_err(),
+            "no Ready broadcast for a pod that didn't take over the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_pod_falls_back_once_the_cached_target_stops_being_selectable() {
+        let (watcher, mut writer) = PodWatcher::for_test(
+            PodSelector::Labels {
+                selector: String::new(),
+            },
+            PodReadiness::Ready,
+        );
+
+        let p1 = mk_pod_full("p1", Some("uid-a"), true, true, false);
+        watcher.test_apply(&mut writer, &p1);
+        let p2 = mk_pod_full("p2", Some("uid-b"), true, true, false);
+        watcher.test_apply(&mut writer, &p2);
+
+        assert_eq!(watcher.ready_pod().expect("a ready pod").name, "p1");
+        assert_eq!(watcher.ready_pod().expect("a ready pod").name, "p1");
+
+        let p1_terminating = mk_pod_full("p1", Some("uid-a"), true, true, true);
+        watcher.test_apply(&mut writer, &p1_terminating);
+        assert_eq!(watcher.ready_pod().expect("a ready pod").name, "p2");
+    }
+
+    #[test]
+    fn died_only_fires_for_the_currently_cached_pod() {
+        let latest: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+        latest.store(Some(Arc::new(ReadyPod::new(
+            "p1".into(),
+            Some("uid-a".into()),
+        ))));
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+
+        handle_deleted_pod(&latest, "old-pod", &change_tx);
+        assert!(change_rx.try_recv().is_err());
+        assert_eq!(latest.load_full().expect("cache untouched").name, "p1");
+
+        handle_deleted_pod(&latest, "p1", &change_tx);
+        assert!(latest.load_full().is_none());
+        assert!(matches!(change_rx.try_recv(), Ok(PodChange::Died(name)) if name == "p1"));
     }
 }
