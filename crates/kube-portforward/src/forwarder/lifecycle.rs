@@ -15,7 +15,10 @@ use super::{
     READY_POD_WAIT,
 };
 use crate::error::Error;
-use crate::pod_watch::PodChange;
+use crate::pod_watch::{
+    PodChange,
+    PodWatcher,
+};
 use crate::recovery::RecoverySignal;
 use crate::session::Session;
 
@@ -174,6 +177,7 @@ impl Forwarder {
 
     pub(super) async fn spawn_pod_change_reactor(&self) {
         let mut rx = self.pod_watcher.subscribe();
+        let pod_watcher = Arc::clone(&self.pod_watcher);
         let sessions = Arc::clone(&self.sessions);
         let cancel = self.cancel.clone();
         let recovery_cb = Arc::clone(&self.recovery_callback);
@@ -184,7 +188,7 @@ impl Forwarder {
                     () = cancel.cancelled() => break,
                     ev = rx.recv() => match ev {
                         Ok(PodChange::Died(name)) => {
-                            if handle_pod_died(&sessions, &name).await {
+                            if handle_pod_died(&sessions, &pod_watcher, &name).await {
                                 debug!("forwarder: pod {} died, draining sessions", name);
                                 (recovery_cb)(RecoverySignal::ServerClose);
                             }
@@ -199,7 +203,9 @@ impl Forwarder {
     }
 }
 
-async fn handle_pod_died(sessions: &TokioRwLock<SessionPool>, dead_pod_name: &str) -> bool {
+async fn handle_pod_died(
+    sessions: &TokioRwLock<SessionPool>, pod_watcher: &PodWatcher, dead_pod_name: &str,
+) -> bool {
     let drained = {
         let mut pool = sessions.write().await;
         if pool
@@ -207,6 +213,13 @@ async fn handle_pod_died(sessions: &TokioRwLock<SessionPool>, dead_pod_name: &st
             .as_ref()
             .is_none_or(|target| target.name != dead_pod_name)
         {
+            return false;
+        }
+        let target_uid = pool
+            .target
+            .as_ref()
+            .and_then(|target| target.uid.as_deref());
+        if pod_watcher.contains_identity(dead_pod_name, target_uid) {
             return false;
         }
         pool.target = None;
@@ -227,7 +240,13 @@ mod tests {
         PooledSession,
         fake_session,
     };
-    use crate::pod_watch::ReadyPod;
+    use crate::pod_watch::{
+        PodReadiness,
+        PodSelector,
+        ReadyPod,
+        ready_test_pod,
+        unready_test_pod,
+    };
 
     fn ready(name: &str, uid: &str) -> ReadyPod {
         ReadyPod::new(name.into(), Some(uid.into()))
@@ -236,6 +255,12 @@ mod tests {
     #[tokio::test]
     async fn died_event_for_a_non_target_pod_does_not_drain_the_pool() {
         let sessions = TokioRwLock::new(SessionPool::new());
+        let (watcher, _writer) = PodWatcher::for_test(
+            PodSelector::Labels {
+                selector: String::new(),
+            },
+            PodReadiness::Ready,
+        );
         let pod_b = ready("b", "uid-b");
         let session_b = fake_session(8080).await;
         {
@@ -248,7 +273,7 @@ mod tests {
             pool.refresh_snapshot();
         }
 
-        let drained = handle_pod_died(&sessions, "a").await;
+        let drained = handle_pod_died(&sessions, &watcher, "a").await;
         assert!(
             !drained,
             "an old pod's Died event must not match an unrelated target"
@@ -256,9 +281,108 @@ mod tests {
         assert!(!session_b.cancellation_token().is_cancelled());
         assert_eq!(sessions.read().await.entries.len(), 1);
 
-        let drained = handle_pod_died(&sessions, "b").await;
+        let drained = handle_pod_died(&sessions, &watcher, "b").await;
         assert!(drained, "Died for the actual target must drain the pool");
         assert!(session_b.cancellation_token().is_cancelled());
+        assert!(sessions.read().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_died_event_does_not_cancel_a_same_name_replacement_pod() {
+        let (watcher, mut writer) =
+            PodWatcher::for_test(PodSelector::Name("p".into()), PodReadiness::Ready);
+        watcher.test_apply(&mut writer, &ready_test_pod("p", "uid-a"));
+        watcher.test_apply(&mut writer, &ready_test_pod("p", "uid-b"));
+        assert_eq!(
+            watcher
+                .ready_pod()
+                .expect("replacement pod is ready")
+                .uid
+                .as_deref(),
+            Some("uid-b")
+        );
+
+        let sessions = TokioRwLock::new(SessionPool::new());
+        let session_b = fake_session(8080).await;
+        {
+            let mut pool = sessions.write().await;
+            pool.target = Some(ready("p", "uid-b"));
+            pool.entries.push(PooledSession {
+                session: Arc::clone(&session_b),
+                created_at: Instant::now(),
+            });
+            pool.refresh_snapshot();
+        }
+
+        let drained = handle_pod_died(&sessions, &watcher, "p").await;
+
+        assert!(
+            !drained,
+            "a stale death for the replaced incarnation must not drain the live replacement"
+        );
+        assert!(!session_b.cancellation_token().is_cancelled());
+        assert_eq!(sessions.read().await.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_died_event_does_not_cancel_an_unready_replacement_pod() {
+        let (watcher, mut writer) =
+            PodWatcher::for_test(PodSelector::Name("p".into()), PodReadiness::Ready);
+        watcher.test_apply(&mut writer, &ready_test_pod("p", "uid-a"));
+        watcher.test_apply(&mut writer, &ready_test_pod("p", "uid-b"));
+        watcher.test_apply(&mut writer, &unready_test_pod("p", "uid-b"));
+        assert!(
+            watcher.ready_pod().is_none(),
+            "ready_pod() filters out a pod that's currently failing readiness"
+        );
+
+        let sessions = TokioRwLock::new(SessionPool::new());
+        let session_b = fake_session(8080).await;
+        {
+            let mut pool = sessions.write().await;
+            pool.target = Some(ready("p", "uid-b"));
+            pool.entries.push(PooledSession {
+                session: Arc::clone(&session_b),
+                created_at: Instant::now(),
+            });
+            pool.refresh_snapshot();
+        }
+
+        let drained = handle_pod_died(&sessions, &watcher, "p").await;
+
+        assert!(
+            !drained,
+            "a replacement still present in the store, even temporarily unready, must not be cancelled by a stale death"
+        );
+        assert!(!session_b.cancellation_token().is_cancelled());
+        assert_eq!(sessions.read().await.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn real_current_target_death_drains_the_pool() {
+        let (watcher, _writer) =
+            PodWatcher::for_test(PodSelector::Name("p".into()), PodReadiness::Ready);
+        assert!(watcher.ready_pod().is_none());
+
+        let sessions = TokioRwLock::new(SessionPool::new());
+        let session_a = fake_session(8080).await;
+        {
+            let mut pool = sessions.write().await;
+            pool.target = Some(ready("p", "uid-a"));
+            pool.entries.push(PooledSession {
+                session: Arc::clone(&session_a),
+                created_at: Instant::now(),
+            });
+            pool.refresh_snapshot();
+        }
+
+        let drained = handle_pod_died(&sessions, &watcher, "p").await;
+
+        assert!(
+            drained,
+            "a genuine death of the current target must drain the pool"
+        );
+        assert!(session_a.cancellation_token().is_cancelled());
         assert!(sessions.read().await.entries.is_empty());
     }
 }

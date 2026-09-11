@@ -162,7 +162,12 @@ impl PodWatcher {
                         () = reflector_cancel.cancelled() => break,
                         next = stream.next() => match next {
                             Some(Ok(watcher::Event::Delete(pod))) => {
-                                handle_deleted_pod(&reflector_latest, &pod.name_any(), &reflector_change_tx);
+                                handle_deleted_pod(
+                                    &reflector_latest,
+                                    &pod.name_any(),
+                                    pod.metadata.uid.as_deref(),
+                                    &reflector_change_tx,
+                                );
                             }
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
@@ -312,6 +317,13 @@ impl PodWatcher {
             .into_iter()
             .any(|pod| is_pod_selected(&pod, &self.selector, PodReadiness::Running))
     }
+
+    pub(crate) fn contains_identity(&self, name: &str, uid: Option<&str>) -> bool {
+        self.store
+            .state()
+            .into_iter()
+            .any(|pod| pod.name_any() == name && pod.metadata.uid.as_deref() == uid)
+    }
 }
 
 fn update_latest(
@@ -344,16 +356,23 @@ fn update_latest(
 }
 
 fn handle_deleted_pod(
-    latest: &Arc<ArcSwapOption<ReadyPod>>, name: &str, change_tx: &broadcast::Sender<PodChange>,
+    latest: &Arc<ArcSwapOption<ReadyPod>>, name: &str, uid: Option<&str>,
+    change_tx: &broadcast::Sender<PodChange>,
 ) {
     let prev = latest.rcu(|cur| {
-        if cur.as_deref().is_some_and(|c| c.name == name) {
+        if cur
+            .as_deref()
+            .is_some_and(|c| c.name == name && c.uid.as_deref() == uid)
+        {
             None
         } else {
             cur.clone()
         }
     });
-    if prev.as_deref().is_some_and(|c| c.name == name) {
+    if prev
+        .as_deref()
+        .is_some_and(|c| c.name == name && c.uid.as_deref() == uid)
+    {
         let _ = change_tx.send(PodChange::Died(name.to_string()));
     }
 }
@@ -387,6 +406,43 @@ fn is_pod_selected(pod: &Pod, selector: &PodSelector, readiness: PodReadiness) -
                     .unwrap_or(false)
         }
     }
+}
+
+#[cfg(test)]
+fn test_pod_with_readiness(name: &str, uid: &str, ready: bool) -> Pod {
+    use k8s_openapi::api::core::v1::{
+        PodCondition,
+        PodStatus,
+    };
+    use kube::api::ObjectMeta;
+
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            uid: Some(uid.to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".into(),
+                status: if ready { "True" } else { "False" }.into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn ready_test_pod(name: &str, uid: &str) -> Pod {
+    test_pod_with_readiness(name, uid, true)
+}
+
+#[cfg(test)]
+pub(crate) fn unready_test_pod(name: &str, uid: &str) -> Pod {
+    test_pod_with_readiness(name, uid, false)
 }
 
 #[cfg(test)]
@@ -664,11 +720,32 @@ mod tests {
         ))));
         let (change_tx, mut change_rx) = broadcast::channel(4);
 
-        handle_deleted_pod(&latest, "old-pod", &change_tx);
+        handle_deleted_pod(&latest, "old-pod", Some("uid-x"), &change_tx);
         assert!(change_rx.try_recv().is_err());
         assert_eq!(latest.load_full().expect("cache untouched").name, "p1");
 
-        handle_deleted_pod(&latest, "p1", &change_tx);
+        handle_deleted_pod(&latest, "p1", Some("uid-a"), &change_tx);
+        assert!(latest.load_full().is_none());
+        assert!(matches!(change_rx.try_recv(), Ok(PodChange::Died(name)) if name == "p1"));
+    }
+
+    #[test]
+    fn handle_deleted_pod_ignores_a_stale_delete_for_a_replaced_uid() {
+        let latest: Arc<ArcSwapOption<ReadyPod>> = Arc::new(ArcSwapOption::const_empty());
+        latest.store(Some(Arc::new(ReadyPod::new(
+            "p1".into(),
+            Some("uid-b".into()),
+        ))));
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+
+        handle_deleted_pod(&latest, "p1", Some("uid-a"), &change_tx);
+        assert!(change_rx.try_recv().is_err());
+        assert_eq!(
+            latest.load_full().expect("cache untouched").uid.as_deref(),
+            Some("uid-b")
+        );
+
+        handle_deleted_pod(&latest, "p1", Some("uid-b"), &change_tx);
         assert!(latest.load_full().is_none());
         assert!(matches!(change_rx.try_recv(), Ok(PodChange::Died(name)) if name == "p1"));
     }

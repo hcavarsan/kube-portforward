@@ -177,3 +177,101 @@ impl Drop for ReplenishGuard<'_> {
         self.0.store(false, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::time::Duration;
+
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+        DuplexStream,
+        ReadHalf,
+        WriteHalf,
+    };
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    type LoopbackConn = (
+        spdy_mux::RawSpdyWriter<WriteHalf<DuplexStream>>,
+        spdy_mux::RawSpdyReader<ReadHalf<DuplexStream>>,
+    );
+
+    fn loopback_conn(kill_rx: Option<oneshot::Receiver<()>>) -> LoopbackConn {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let echo = async {
+                loop {
+                    let mut header = [0; 8];
+                    if server.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let length = u32::from_be_bytes([0, header[5], header[6], header[7]]) as usize;
+                    let mut payload = vec![0; length];
+                    if server.read_exact(&mut payload).await.is_err() {
+                        return;
+                    }
+                    let control = header[0] & 0x80 != 0;
+                    let ping = control && u16::from_be_bytes([header[2], header[3]]) == 6;
+                    if (ping || (!control && !payload.is_empty()))
+                        && (server.write_all(&header).await.is_err()
+                            || server.write_all(&payload).await.is_err())
+                    {
+                        return;
+                    }
+                }
+            };
+            if let Some(kill) = kill_rx {
+                tokio::select! {
+                    _ = kill => {}
+                    () = echo => {}
+                }
+            } else {
+                echo.await;
+            }
+        });
+        spdy_mux::split_raw_spdy(client)
+    }
+
+    #[tokio::test]
+    async fn connect_skips_a_cached_spare_bound_to_a_dead_mux() {
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let mux = spdy_mux::Session::with_config(
+            vec![loopback_conn(Some(kill_rx)), loopback_conn(None)],
+            CancellationToken::new(),
+            spdy_mux::MuxConfig::default(),
+        )
+        .await
+        .unwrap();
+        let session = Session::from_spdy(mux, Subprotocol::LegacySpdy, 8080);
+        let capacity = session.inner.capacity();
+        for _ in 0..2 {
+            let spare = session.open_new_stream().await.unwrap();
+            assert!(session.spare_streams.push(spare).is_ok());
+        }
+        kill_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.inner.capacity() == capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let mut stream = session.connect().await.unwrap();
+            let payload = b"hello-through-the-healthy-transport";
+            let received = tokio::time::timeout(Duration::from_secs(5), async {
+                stream.write_all(payload).await?;
+                let mut received = vec![0; payload.len()];
+                stream.read_exact(&mut received).await?;
+                Ok::<_, io::Error>(received)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+}

@@ -38,10 +38,10 @@ use crate::mux::{
 ///
 /// Streams are **lazily opened on the wire**: `MuxHandle::open_stream_pair`
 /// reserves a session slot and creates the per-stream channels, but no
-/// SPDY `SYN_STREAM` frame is sent until the consumer actually writes or
-/// reads. This avoids the idle-upstream-close race for peers that dial
-/// an upstream connection eagerly on `SYN_STREAM` while preserving the
-/// pre-opened spare-stream throughput optimization.
+/// SPDY `SYN_STREAM` frame is sent until the consumer reads, writes, or
+/// shuts down the stream. This avoids the idle-upstream-close race for
+/// peers that dial an upstream connection eagerly on `SYN_STREAM` while
+/// preserving the pre-opened spare-stream throughput optimization.
 ///
 /// Implements `AsyncRead + AsyncWrite` on the data half. The error half is
 /// available via `split()`.
@@ -52,7 +52,7 @@ pub struct Stream {
 enum StreamState {
     /// Pair reserved, channels created, but no SPDY stream IDs allocated
     /// and no `SYN_STREAM` on the wire yet. Transitions to `Opened` on the
-    /// first non-empty `poll_write`, or the first real `poll_read`.
+    /// first non-empty write, real read, or write-half shutdown.
     Unopened {
         error_headers: Vec<(String, String)>,
         data_headers: Vec<(String, String)>,
@@ -233,17 +233,16 @@ impl Stream {
         }
     }
 
-    /// Returns true if the remote has already closed this stream's read
-    /// side (FIN or RST received while idle). Used by spare-stream checkout
-    /// to discard stale pre-opened streams.
-    ///
-    /// Unopened streams are never stale: no `SYN_STREAM` was sent yet, so
-    /// the apiserver hasn't created a backing pod TCP connection.
+    /// Returns true if this stream's read side is closed or its
+    /// unopened pair belongs to a closed mux.
     pub fn is_read_closed(&self) -> bool {
         match &self.state {
             StreamState::Unopened {
-                read_eof, data_rx, ..
-            } => *read_eof || data_rx.is_closed(),
+                read_eof,
+                data_rx,
+                mux,
+                ..
+            } => *read_eof || data_rx.is_closed() || mux.is_closed(),
             StreamState::Opened {
                 read_eof, data_rx, ..
             } => *read_eof || data_rx.is_closed(),
@@ -720,17 +719,17 @@ impl AsyncWrite for Stream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(e) = ensure_open(this) {
+            return Poll::Ready(Err(e));
+        }
         match &mut this.state {
-            // Unopened: no SPDY stream exists yet. There is nothing on the
-            // wire to half-close. Drop will release the local slot when the
-            // Stream goes out of scope.
-            StreamState::Unopened { .. } => Poll::Ready(Ok(())),
             StreamState::Opened {
                 graceful_shutdown,
                 write_tx,
                 data_id,
                 ..
             } => poll_shutdown_opened(graceful_shutdown, write_tx, *data_id, cx),
+            StreamState::Unopened { .. } => unreachable!("handled above"),
             StreamState::Transitioning => unreachable!(),
         }
     }
@@ -815,8 +814,8 @@ fn ensure_shared_open(shared: &parking_lot::Mutex<SharedSplitState>) -> io::Resu
 }
 
 /// Data half of a split SPDY stream: AsyncRead (from pod) + AsyncWrite (to
-/// pod). Lazy open fires on the first non-empty write, or the first real
-/// read, through this half.
+/// pod). Lazy open fires on the first real read, non-empty write, or
+/// shutdown through this half.
 pub struct DataStream {
     data_rx: mpsc::Receiver<Bytes>,
     max_frame_size: u32,
@@ -904,12 +903,15 @@ impl AsyncWrite for DataStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Err(e) = ensure_shared_open(&this.shared) {
+            return Poll::Ready(Err(e));
+        }
         let mut guard = this.shared.lock();
         match &mut *guard {
-            SharedSplitState::Unopened(_) => Poll::Ready(Ok(())),
             SharedSplitState::Opened(o) => {
                 poll_shutdown_opened(&o.graceful_shutdown, &mut o.write_tx, o.data_id, cx)
             }
+            SharedSplitState::Unopened(_) => unreachable!("handled above"),
             SharedSplitState::Transitioning => unreachable!(),
         }
     }
@@ -1653,5 +1655,93 @@ mod tests {
         let (mux, mut peer) = spawn_test_peer(test_config()).await;
         let (stream, _errors) = mux.open_stream_pair(vec![], vec![]).unwrap().split();
         exercise_write_shutdown(stream, &mut peer).await;
+    }
+
+    async fn exercise_empty_request_shutdown(
+        mut stream: impl AsyncRead + AsyncWrite + Unpin, peer: &mut TestPeer,
+    ) {
+        let reply = b"response-to-empty-request".repeat(64);
+        let client = async {
+            stream.shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, reply);
+        };
+        let server = async {
+            let error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            assert!(matches!(
+                peer.recv().await,
+                Frame::Data { stream_id, fin: true, .. } if stream_id == error_id
+            ));
+            match peer.recv().await {
+                Frame::Data {
+                    stream_id,
+                    payload,
+                    fin,
+                } if stream_id == data_id => {
+                    assert!(payload.is_empty(), "empty request must carry no bytes");
+                    assert!(
+                        fin,
+                        "shutdown before any write must still send FIN so the peer sees EOF"
+                    );
+                }
+                frame => panic!("expected empty DATA+FIN for data_id, got {frame:?}"),
+            }
+            peer.send_data(data_id, &reply, true);
+        };
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(client, server);
+        })
+        .await
+        .expect("empty-request shutdown must realize the stream and preserve response reads");
+    }
+
+    #[tokio::test]
+    async fn empty_request_shutdown_realizes_unsplit_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let stream = mux.open_stream_pair(vec![], vec![]).unwrap();
+        exercise_empty_request_shutdown(stream, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn empty_request_shutdown_realizes_split_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let (stream, _errors) = mux.open_stream_pair(vec![], vec![]).unwrap().split();
+        exercise_empty_request_shutdown(stream, &mut peer).await;
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let start = tokio::time::Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_realize_fails_once_mux_is_closed() {
+        let (mux, peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+
+        drop(peer);
+        assert!(
+            wait_until(|| mux.is_closed(), TEST_TIMEOUT).await,
+            "mux must observe the transport break"
+        );
+
+        let err = tokio::time::timeout(TEST_TIMEOUT, stream.shutdown())
+            .await
+            .expect("shutdown on a dead mux must not hang")
+            .expect_err("shutdown on an already-closed mux must not silently succeed");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }
