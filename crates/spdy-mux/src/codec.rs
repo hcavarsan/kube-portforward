@@ -27,6 +27,15 @@ const FLAG_FIN: u8 = 0x01;
 const SETTINGS_INITIAL_WINDOW_SIZE: u32 = 7;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u32 = 4;
 
+/// Upper bound on a control-frame payload. Control frames are exempt from
+/// the negotiated DATA frame size, but they feed the header decompressor,
+/// so they need their own ceiling.
+const MAX_CONTROL_FRAME_SIZE: usize = 1 << 20;
+
+/// Upper bound on a decompressed header block. Guards against a zlib bomb
+/// inflating a small control frame into an unbounded buffer.
+const MAX_HEADER_BLOCK_SIZE: usize = 1 << 20;
+
 /// Decoded SPDY frame.
 #[derive(Debug)]
 pub(crate) enum Frame {
@@ -259,14 +268,20 @@ impl SpdyCodec {
         let flags = (flags_len >> 24) as u8;
         let payload_len = (flags_len & 0x00FF_FFFF) as usize;
 
-        // frame size check for DATA frames (control frames are usually
-        // small and exempt per SPDY spec).
-        if !is_control && payload_len > self.max_frame_size as usize {
+        // DATA frames honour the negotiated limit; control frames carry
+        // compressed header blocks and are bounded separately so a peer
+        // cannot force a multi-megabyte inflate.
+        let limit = if is_control {
+            MAX_CONTROL_FRAME_SIZE
+        } else {
+            self.max_frame_size as usize
+        };
+        if payload_len > limit {
             let stream_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) & 0x7FFF_FFFF;
             return Err(Error::FrameTooLarge {
                 stream_id,
                 size: payload_len,
-                max: self.max_frame_size,
+                max: limit as u32,
             });
         }
 
@@ -498,7 +513,7 @@ impl SpdyCodec {
             return Ok(Vec::new());
         }
 
-        let mut output = vec![0u8; compressed.len() * 4 + 1024];
+        let mut output = vec![0u8; (compressed.len() * 4 + 1024).min(MAX_HEADER_BLOCK_SIZE)];
 
         // track absolute positions via the decompressor's counters.
         let base_in = self.decompressor.total_in() as usize;
@@ -509,7 +524,7 @@ impl SpdyCodec {
             let cur_out = self.decompressor.total_out() as usize - base_out;
 
             if cur_out >= output.len().saturating_sub(256) {
-                output.resize(output.len() * 2, 0);
+                grow_header_buffer(&mut output)?;
             }
 
             let decompress_status = self.decompressor.decompress(
@@ -534,7 +549,7 @@ impl SpdyCodec {
                             if new_in >= compressed.len() {
                                 return parse_header_block(&output[..new_out]);
                             }
-                            output.resize(output.len() * 2, 0);
+                            grow_header_buffer(&mut output)?;
                         }
                         Status::StreamEnd => {
                             return parse_header_block(&output[..new_out]);
@@ -571,6 +586,9 @@ fn parse_header_block(block_bytes: &[u8]) -> Result<Vec<(String, String)>, Error
         block_bytes[2],
         block_bytes[3],
     ]) as usize;
+    if num_headers > (block_bytes.len() - 4) / 8 {
+        return Err(Error::InvalidFrame("header count exceeds header block"));
+    }
     let mut headers = Vec::with_capacity(num_headers);
     let mut offset = 4;
 
@@ -615,6 +633,15 @@ fn parse_header_block(block_bytes: &[u8]) -> Result<Vec<(String, String)>, Error
     }
 
     Ok(headers)
+}
+
+/// Doubles a header decompression buffer up to [`MAX_HEADER_BLOCK_SIZE`].
+fn grow_header_buffer(output: &mut Vec<u8>) -> Result<(), Error> {
+    if output.len() >= MAX_HEADER_BLOCK_SIZE {
+        return Err(Error::InvalidFrame("header block too large"));
+    }
+    output.resize((output.len() * 2).min(MAX_HEADER_BLOCK_SIZE), 0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -918,6 +945,77 @@ mod tests {
                 assert_eq!(max, 10);
             }
             other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_count_larger_than_the_block_is_rejected() {
+        let mut block = u32::MAX.to_be_bytes().to_vec();
+        block.extend_from_slice(&4u32.to_be_bytes());
+        block.extend_from_slice(b"host");
+        block.extend_from_slice(&1u32.to_be_bytes());
+        block.push(b"a"[0]);
+
+        match parse_header_block(&block) {
+            Err(Error::InvalidFrame(reason)) => {
+                assert_eq!(reason, "header count exceeds header block");
+            }
+            other => panic!("expected InvalidFrame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_count_matching_the_block_still_parses() {
+        let mut block = 1u32.to_be_bytes().to_vec();
+        block.extend_from_slice(&4u32.to_be_bytes());
+        block.extend_from_slice(b"host");
+        block.extend_from_slice(&9u32.to_be_bytes());
+        block.extend_from_slice(b"127.0.0.1");
+
+        assert_eq!(
+            parse_header_block(&block).unwrap(),
+            vec![("host".to_owned(), "127.0.0.1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn oversized_control_frame_is_rejected_before_inflating() {
+        let payload_len = MAX_CONTROL_FRAME_SIZE + 1;
+        let mut frame = Vec::with_capacity(8 + payload_len);
+        frame.extend_from_slice(&SPDY_VERSION.to_be_bytes());
+        frame.extend_from_slice(&SYN_REPLY_TYPE.to_be_bytes());
+        frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        frame.resize(8 + payload_len, 0);
+
+        let mut codec = fresh_codec();
+        let mut buf = BytesMut::from(&frame[..]);
+        match codec.decode_frame(&mut buf) {
+            Err(Error::FrameTooLarge { size, max, .. }) => {
+                assert_eq!(size, payload_len);
+                assert_eq!(max, MAX_CONTROL_FRAME_SIZE as u32);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zlib_bombed_header_block_stops_at_the_ceiling() {
+        let mut compressor = Compress::new(flate2::Compression::best(), true);
+        compressor.set_dictionary(SPDY_DICT).unwrap();
+        let bomb = vec![0u8; MAX_HEADER_BLOCK_SIZE * 4];
+        let mut compressed = vec![0u8; bomb.len()];
+        compressor
+            .compress(&bomb, &mut compressed, FlushCompress::Sync)
+            .unwrap();
+        let compressed_len = compressor.total_out() as usize;
+        compressed.truncate(compressed_len);
+
+        let mut codec = fresh_codec();
+        match codec.decompress_headers(&compressed) {
+            Err(Error::InvalidFrame(reason)) => {
+                assert_eq!(reason, "header block too large");
+            }
+            other => panic!("expected InvalidFrame, got {other:?}"),
         }
     }
 }
