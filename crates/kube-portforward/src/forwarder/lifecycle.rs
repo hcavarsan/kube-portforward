@@ -14,6 +14,7 @@ use super::{
     Forwarder,
     READY_POD_WAIT,
 };
+use crate::ReadyPod;
 use crate::error::Error;
 use crate::pod_watch::{
     PodChange,
@@ -31,7 +32,7 @@ impl Forwarder {
     /// not use.
     pub(super) async fn ensure_session_for_pod(
         &self, target_port: u16,
-    ) -> Result<(Arc<Session>, String), Error> {
+    ) -> Result<(Arc<Session>, ReadyPod), Error> {
         let call_id = self.next_call_id();
         let t_total = Instant::now();
         let mut retry_after_stale_open = true;
@@ -75,14 +76,14 @@ impl Forwarder {
 
             // reuse an existing non-full session.
             if let Some(s) = self.try_reuse_session(target_port, &ready).await {
-                return Ok((s, ready.name));
+                return Ok((s, ready));
             }
 
             self.retire_dead_sessions().await;
 
             if let Some(s) = self.find_reusable_session() {
                 self.maybe_prefetch(&s, target_port, &ready).await;
-                return Ok((s, ready.name));
+                return Ok((s, ready));
             }
 
             // if another caller is already opening (or prefetching) a
@@ -108,7 +109,7 @@ impl Forwarder {
                     let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
                     // newly created session should be available now.
                     if let Some(s) = self.try_reuse_session(target_port, &ready).await {
-                        return Ok((s, ready.name));
+                        return Ok((s, ready));
                     }
                     // failed or was full.
                 }
@@ -157,7 +158,7 @@ impl Forwarder {
                             u64::try_from(t_total.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "ensure_session: total"
                     );
-                    return Ok((session, ready.name));
+                    return Ok((session, ready));
                 }
                 Err(stale) => {
                     stale.cancellation_token().cancel();

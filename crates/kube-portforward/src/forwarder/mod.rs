@@ -32,6 +32,7 @@ use tokio::sync::{
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::ReadyPod;
 use crate::client::Client;
 use crate::error::Error;
 use crate::pod_watch::{
@@ -109,8 +110,9 @@ impl Forwarder {
     /// A named target port resolves to a number in one pod's spec, and a
     /// rollout can map the same name to a different number. A caller that
     /// resolved the port itself needs the pod identity to tell whether the
-    /// number it used still applies.
-    pub async fn connect_on_pod(&self, target_port: u16) -> Result<(Stream, String), Error> {
+    /// number it used still applies. The identity carries the UID as well as
+    /// the name, because a StatefulSet replacement reuses the name.
+    pub async fn connect_on_pod(&self, target_port: u16) -> Result<(Stream, ReadyPod), Error> {
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(Error::Cancelled),
@@ -141,6 +143,12 @@ impl Forwarder {
 
     pub fn ready_pod(&self) -> Option<String> {
         self.pod_watcher.ready_pod().map(|p| p.name)
+    }
+
+    /// Ready pod with its UID, which a name alone cannot distinguish after a
+    /// StatefulSet replaces a pod under the same name.
+    pub fn ready_pod_identity(&self) -> Option<ReadyPod> {
+        self.pod_watcher.ready_pod()
     }
 
     pub async fn wait_for_ready_pod(&self, timeout: Duration) -> Option<String> {
