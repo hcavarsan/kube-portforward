@@ -98,6 +98,19 @@ impl Forwarder {
     /// for a ready pod on first call. Opens new sessions on demand and
     /// retires drained ones.
     pub async fn connect(&self, target_port: u16) -> Result<Stream, Error> {
+        self.connect_on_pod(target_port)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Same as [`connect`](Self::connect), reporting the pod the stream
+    /// reaches.
+    ///
+    /// A named target port resolves to a number in one pod's spec, and a
+    /// rollout can map the same name to a different number. A caller that
+    /// resolved the port itself needs the pod identity to tell whether the
+    /// number it used still applies.
+    pub async fn connect_on_pod(&self, target_port: u16) -> Result<(Stream, String), Error> {
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(Error::Cancelled),
@@ -106,9 +119,9 @@ impl Forwarder {
                     return Err(Error::Configuration("target port must be greater than zero".into()));
                 }
                 for _ in 0..self.config.max_sessions {
-                    let session = self.ensure_session(target_port).await?;
+                    let (session, pod) = self.ensure_session_for_pod(target_port).await?;
                     match session.connect().await {
-                        Ok(stream) => return Ok(stream),
+                        Ok(stream) => return Ok((stream, pod)),
                         Err(Error::CapacityExhausted { .. }) => {}
                         Err(err) => return Err(err),
                     }
