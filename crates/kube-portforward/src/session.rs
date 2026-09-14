@@ -44,6 +44,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// Target pod port every stream this session opens is paired with.
+    ///
+    /// Stamped into the SYN_STREAM header at open time, so a session cannot
+    /// serve a different port.
+    pub(crate) const fn port(&self) -> u16 {
+        self.port
+    }
+
     pub(crate) fn from_spdy(session: spdy_mux::Session, protocol: Subprotocol, port: u16) -> Self {
         Self {
             spare_streams: ArrayQueue::new(SPARE_STREAM_CAP),

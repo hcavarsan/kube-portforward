@@ -81,7 +81,7 @@ impl Forwarder {
 
             self.retire_dead_sessions().await;
 
-            if let Some(s) = self.find_reusable_session() {
+            if let Some(s) = self.find_reusable_session(target_port) {
                 self.maybe_prefetch(&s, target_port, &ready).await;
                 return Ok((s, ready));
             }

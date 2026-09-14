@@ -139,14 +139,25 @@ impl Forwarder {
     /// The hot queue serves as a recency hint via `refresh_snapshot`, but
     /// reads use the snapshot directly to avoid pop-then-push-back races
     /// that can drop valid sessions when the queue is full.
-    pub(super) fn find_reusable_session(&self) -> Option<Arc<Session>> {
+    pub(super) fn find_reusable_session(&self, target_port: u16) -> Option<Arc<Session>> {
         let snap = self.session_snap.load();
         for session in snap.iter() {
-            if !session.cancellation_token().is_cancelled() && !session.is_full() {
+            if Self::session_serves(session, target_port) {
                 return Some(Arc::clone(session));
             }
         }
         None
+    }
+
+    /// Whether this session can carry a stream for `target_port`.
+    ///
+    /// The port is fixed when the session is opened and goes into the
+    /// SYN_STREAM header of every stream it pairs, so a session opened for a
+    /// different port would silently send the traffic to that other port.
+    fn session_serves(session: &Arc<Session>, target_port: u16) -> bool {
+        session.port() == target_port
+            && !session.cancellation_token().is_cancelled()
+            && !session.is_full()
     }
 
     pub(super) async fn try_reuse_session(
@@ -154,7 +165,7 @@ impl Forwarder {
     ) -> Option<Arc<Session>> {
         let snap = self.session_snap.load();
         for session in snap.iter() {
-            if !session.cancellation_token().is_cancelled() && !session.is_full() {
+            if Self::session_serves(session, target_port) {
                 let chosen = Arc::clone(session);
                 // release the snapshot guard before awaiting.
                 drop(snap);
@@ -277,5 +288,26 @@ mod tests {
         assert!(session_b.cancellation_token().is_cancelled());
         assert!(!session_a.cancellation_token().is_cancelled());
         session_a.cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn a_pooled_session_only_serves_the_port_it_was_opened_for() {
+        let session = fake_session(8080).await;
+
+        assert!(
+            Forwarder::session_serves(&session, 8080),
+            "the session opened for this port must be reused"
+        );
+        assert!(
+            !Forwarder::session_serves(&session, 9090),
+            "a session stamps its own port into every stream it opens, so reusing it for another \
+             port would send that traffic to 8080"
+        );
+
+        session.cancellation_token().cancel();
+        assert!(
+            !Forwarder::session_serves(&session, 8080),
+            "a cancelled session must not be reused"
+        );
     }
 }
