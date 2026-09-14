@@ -44,6 +44,32 @@ jobs:
             echo "Unrecognised ref ${{ github.ref_name }}" >&2
             exit 1
           fi
+      # Both tags are pushed together and each starts its own run, so the
+      # kube-portforward run can reach the index before spdy-mux has been
+      # published to it. Publishing is not retried automatically, so without
+      # this the release simply fails.
+      - name: Wait for spdy-mux on the index
+        if: steps.which.outputs.crate == 'kube-portforward'
+        run: |
+          set -euo pipefail
+          want=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kube-portforward")
+                     | .dependencies[] | select(.name == "spdy-mux") | .req' \
+            | tr -d '^=~ ')
+          echo "kube-portforward requires spdy-mux $want"
+          url="https://index.crates.io/sp/dy/spdy-mux"
+          for _ in $(seq 1 60); do
+            # The sparse index is newline-delimited JSON, so the whole
+            # response is slurped before asking whether the version is there.
+            if curl -sf "$url" | jq -e -s --arg want "$want" \
+                 'any(.[]; .vers == $want)' >/dev/null; then
+              echo "spdy-mux $want is on the index"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "spdy-mux $want never appeared on the index" >&2
+          exit 1
       - name: cargo publish --dry-run
         run: cargo publish --dry-run -p ${{ steps.which.outputs.crate }} --locked
       - name: cargo publish
