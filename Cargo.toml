@@ -3,9 +3,9 @@ resolver = "2"
 members = ["crates/spdy-mux", "crates/kube-portforward"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "GPL-3.0-only"
 repository = "https://github.com/hcavarsan/kube-portforward"
 authors = ["Henrique Cavarsan <hcavarsan@gmail.com>"]
@@ -20,8 +20,8 @@ fastwebsockets = { version = "0.10", features = ["unstable-split"] }
 flate2 = "1.1"
 futures = "0.3"
 http = "1.5"
-hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1.20", features = [
+hyper = { version = "1.12.0", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.21", features = [
   "client",
   "client-legacy",
   "client-proxy",
@@ -29,6 +29,7 @@ hyper-util = { version = "0.1.20", features = [
   "server",
   "tokio",
 ] }
+# Match kube's k8s-openapi minor version until kube-rs/kube#2120 is released.
 k8s-openapi = { version = "0.28.0", default-features = false, features = [
   "latest",
 ] }
@@ -42,12 +43,12 @@ kube = { version = "4.2.0", features = [
   "rustls-tls",
 ] }
 kube-runtime = { version = "4.2.0", features = ["unstable-runtime"] }
-parking_lot = "0.12"
-quanta = "0.12"
+parking_lot = "0.13"
+quanta = "0.13"
 rand = "0.10"
-serde_json = "1.0.151"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = [
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = [
   "fs",
   "io-util",
   "macros",
@@ -57,11 +58,11 @@ tokio = { version = "1.53.1", features = [
   "sync",
   "time",
 ] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
-spdy-mux = { version = "0.4.1", path = "crates/spdy-mux" }
+spdy-mux = { version = "0.5.0", path = "crates/spdy-mux" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

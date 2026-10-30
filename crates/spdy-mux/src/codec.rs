@@ -407,9 +407,10 @@ impl SpdyCodec {
                             SETTINGS_MAX_CONCURRENT_STREAMS => {
                                 max_concurrent_streams = Some(value);
                             }
-                            // non-standard: some peers advertise max frame size as
-                            // setting id 5. SPDY/3.1 itself defines settings 1-4 and
-                            // 7-8; id 5 is left for peer-specific extensions.
+                            // non-standard: some peers advertise max frame size
+                            // as setting id 5. SPDY/3.1 itself defines settings
+                            // 1-4 and 7-8; id 5 is left for peer-specific
+                            // extensions.
                             5 => {
                                 max_frame_size = Some(value);
                             }
