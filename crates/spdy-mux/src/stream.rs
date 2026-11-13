@@ -1744,4 +1744,74 @@ mod tests {
             .expect_err("shutdown on an already-closed mux must not silently succeed");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
+
+    async fn open_with_first_read(stream: &mut Stream, peer: &mut TestPeer) -> u32 {
+        let mut first = [0u8; 16];
+        let peer_fut = async {
+            let _error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            let _ = peer.recv().await;
+            peer.send_data(data_id, b"start", false);
+            data_id
+        };
+        let (read, data_id) = tokio::join!(stream.read(&mut first), peer_fut);
+        assert_eq!(&first[..read.unwrap()], b"start");
+        data_id
+    }
+
+    #[tokio::test]
+    async fn slow_reader_keeps_every_byte_and_the_fin() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let data_id = open_with_first_read(&mut stream, &mut peer).await;
+
+        let frames = 200usize;
+        let frame_len = 1024usize;
+        let mut sent = Vec::with_capacity(frames * frame_len);
+        for i in 0..frames {
+            let payload = vec![(i % 251) as u8; frame_len];
+            sent.extend_from_slice(&payload);
+            peer.send_data(data_id, &payload, i == frames - 1);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(TEST_TIMEOUT, stream.read_to_end(&mut rest))
+            .await
+            .expect("read_to_end must reach the FIN")
+            .expect("read_to_end failed");
+        assert_eq!(rest.len(), sent.len());
+        assert!(rest == sent, "bytes must arrive in order");
+    }
+
+    #[tokio::test]
+    async fn peer_overrunning_the_stream_window_gets_flow_control_reset() {
+        let config = MuxConfig {
+            initial_window_size: 64 * 1024,
+            stream_data_buffer: 1,
+            ..test_config()
+        };
+        let (mux, mut peer) = spawn_test_peer(config).await;
+        let mut stream = mux
+            .open_stream_pair(vec![], vec![])
+            .expect("reserve stream pair");
+        let data_id = open_with_first_read(&mut stream, &mut peer).await;
+
+        for _ in 0..100 {
+            peer.send_data(data_id, &[7u8; 1024], false);
+        }
+
+        loop {
+            match peer.recv().await {
+                Frame::RstStream { stream_id, status } if stream_id == data_id => {
+                    assert_eq!(status, crate::mux::RST_STATUS_FLOW_CONTROL);
+                    break;
+                }
+                Frame::WindowUpdate { .. } => {}
+                other => panic!("expected RST_STREAM for the overrun stream, got {other:?}"),
+            }
+        }
+    }
 }
