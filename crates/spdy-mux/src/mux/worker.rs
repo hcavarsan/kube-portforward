@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
 
 use bytes::Bytes;
 use tokio::sync::{
@@ -26,6 +30,8 @@ pub(super) struct StreamState {
     /// Data sender. `None` after remote FIN (half-close).
     data_tx: Option<mpsc::Sender<Bytes>>,
     send_window: Arc<SendWindow>,
+    /// Shared with the reader. Set before `data_tx` is dropped on FIN.
+    remote_fin: Arc<AtomicBool>,
     /// Bytes delivered to the per-stream channel since the last
     /// WINDOW_UPDATE was sent.
     consumed_since_update: u64,
@@ -203,6 +209,7 @@ pub(super) fn dispatch_frame_in_worker(
             if fin {
                 if let Some(state) = streams.get_mut(&stream_id) {
                     tracing::debug!(stream_id, "SPDY DATA FIN received, half-closing read side");
+                    state.remote_fin.store(true, Ordering::Release);
                     state.data_tx = None;
                 }
             }
@@ -229,6 +236,7 @@ pub(super) fn dispatch_frame_in_worker(
             // half-close on SYN_REPLY with FIN
             if fin {
                 if let Some(state) = streams.get_mut(&stream_id) {
+                    state.remote_fin.store(true, Ordering::Release);
                     state.data_tx = None;
                 }
             }
@@ -274,12 +282,14 @@ pub(super) fn apply_registration(
             data_tx,
             reply_tx,
             send_window,
+            remote_fin,
         } => {
             streams.insert(
                 stream_id,
                 StreamState {
                     data_tx: Some(data_tx),
                     send_window,
+                    remote_fin,
                     consumed_since_update: 0,
                 },
             );

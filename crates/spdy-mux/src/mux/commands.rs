@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
 use tokio::sync::{
@@ -51,6 +52,9 @@ pub(crate) enum StreamRegistration {
         data_tx: mpsc::Sender<Bytes>,
         reply_tx: oneshot::Sender<Result<(), crate::error::Error>>,
         send_window: Arc<SendWindow>,
+        /// Set by the worker when the peer half-closes the stream with FIN,
+        /// so the reader can tell a FIN from a session that went away.
+        remote_fin: Arc<AtomicBool>,
     },
     /// Notify the worker that a stream was closed by the client.
     Close { stream_id: u32 },

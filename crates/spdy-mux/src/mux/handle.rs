@@ -458,6 +458,7 @@ impl MuxHandle {
             self.peer_initial_window.load(Ordering::Acquire),
         ));
         let (data_reply_tx, _data_reply_rx) = oneshot::channel();
+        let data_remote_fin = Arc::new(AtomicBool::new(false));
 
         // all sends below use `try_send`, not `send().await`, while
         // holding `open_seq`. See the rationale in the original
@@ -472,6 +473,7 @@ impl MuxHandle {
                 data_tx: pending_error_tx,
                 reply_tx: error_reply_tx,
                 send_window: Arc::clone(&error_send_window),
+                remote_fin: Arc::new(AtomicBool::new(false)),
             }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -491,6 +493,7 @@ impl MuxHandle {
             data_tx: pending_data_tx,
             reply_tx: data_reply_tx,
             send_window: Arc::clone(&data_send_window),
+            remote_fin: Arc::clone(&data_remote_fin),
         }) {
             Ok(()) => {}
             Err(e) => {
@@ -582,6 +585,7 @@ impl MuxHandle {
             data_id,
             error_id,
             send_window: data_send_window,
+            remote_fin: data_remote_fin,
             ctrl_permit_error,
             ctrl_permit_data,
             close_reg_permit_error,
