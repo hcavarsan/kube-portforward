@@ -43,8 +43,10 @@ pub struct MuxConfig {
     pub idle_timeout: Duration,
     /// Capacity of the dedicated WINDOW_UPDATE channel.
     pub window_buffer_size: usize,
-    /// Per-stream inbound data channel capacity. When full, the worker
-    /// withholds WINDOW_UPDATE for this stream so the peer backs off naturally.
+    /// Per-stream inbound data channel capacity. When full, the worker holds
+    /// later payloads until the reader makes room and withholds their
+    /// WINDOW_UPDATE so the peer backs off. A peer that sends past its
+    /// window gets RST_STREAM with FLOW_CONTROL_ERROR.
     pub stream_data_buffer: usize,
     /// Per-stream inbound error channel capacity.
     pub stream_error_buffer: usize,

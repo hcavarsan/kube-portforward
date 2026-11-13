@@ -1,12 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    VecDeque,
+};
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::{
+    Context,
+    Poll,
+};
 
 use bytes::Bytes;
 use tokio::sync::{
     mpsc,
     oneshot,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{
+    CancellationToken,
+    PollSender,
+};
 
 use super::commands::{
     MuxCommand,
@@ -23,12 +34,150 @@ use crate::error::Error;
 
 /// Per-stream state owned exclusively by one frame worker.
 pub(super) struct StreamState {
-    /// Data sender. `None` after remote FIN (half-close).
-    data_tx: Option<mpsc::Sender<Bytes>>,
+    /// Data sender. `None` after remote FIN (half-close) once every held
+    /// payload reached the channel.
+    data_tx: Option<PollSender<Bytes>>,
+    /// Payloads that arrived while the per-stream channel was full, in
+    /// arrival order. They get no WINDOW_UPDATE credit until they reach the
+    /// channel, so a peer that respects the window keeps this under
+    /// `initial_window_size` bytes.
+    held: VecDeque<Bytes>,
+    held_bytes: u64,
+    /// Remote FIN arrived while `held` still had payloads.
+    fin_after_held: bool,
     send_window: Arc<SendWindow>,
     /// Bytes delivered to the per-stream channel since the last
     /// WINDOW_UPDATE was sent.
     consumed_since_update: u64,
+}
+
+impl StreamState {
+    /// Queue a DATA payload behind any held ones. Returns the RST_STREAM
+    /// status when the stream has to be torn down.
+    fn deliver(
+        &mut self, stream_id: u32, payload: Bytes, window_tx: &mpsc::Sender<MuxCommand>,
+        initial_window_size: u32,
+    ) -> Option<u32> {
+        if self.data_tx.is_none() || self.fin_after_held {
+            return None;
+        }
+        let payload_len = payload.len() as u64;
+        let payload = if self.held.is_empty() {
+            let data_tx = self.data_tx.as_ref()?.get_ref()?;
+            match data_tx.try_send(payload) {
+                Ok(()) => {
+                    self.credit(stream_id, payload_len, window_tx, initial_window_size);
+                    return None;
+                }
+                Err(mpsc::error::TrySendError::Full(payload)) => payload,
+                Err(mpsc::error::TrySendError::Closed(_)) => return Some(RST_STATUS_FLOW_CONTROL),
+            }
+        } else {
+            payload
+        };
+
+        // the channel is full: hold the payload and withhold its credit so
+        // the peer backs off. A peer that sends past the window it was
+        // given is reset instead of growing the hold without bound.
+        self.held_bytes += payload_len;
+        if self.held_bytes > u64::from(initial_window_size) {
+            tracing::debug!(
+                stream_id,
+                held_bytes = self.held_bytes,
+                "SPDY peer overran the stream receive window"
+            );
+            return Some(RST_STATUS_FLOW_CONTROL);
+        }
+        self.held.push_back(payload);
+        None
+    }
+
+    /// Track bytes that reached the per-stream channel and send a
+    /// WINDOW_UPDATE once half the window was consumed.
+    fn credit(
+        &mut self, stream_id: u32, len: u64, window_tx: &mpsc::Sender<MuxCommand>,
+        initial_window_size: u32,
+    ) {
+        self.consumed_since_update += len;
+        if self.consumed_since_update >= u64::from(initial_window_size / 2) {
+            let delta = self.consumed_since_update as u32;
+            // only reset on success; if the channel is full, accumulate and
+            // retry on the next delivery.
+            if window_tx
+                .try_send(MuxCommand::EncodeWindowUpdate { stream_id, delta })
+                .is_ok()
+            {
+                self.consumed_since_update = 0;
+            }
+        }
+    }
+
+    /// Remote FIN: close the data sender so the consumer reads EOF, after
+    /// any held payloads.
+    fn half_close(&mut self) {
+        if self.held.is_empty() {
+            self.data_tx = None;
+        } else {
+            self.fin_after_held = true;
+        }
+    }
+}
+
+/// Move held payloads into their per-stream channels as readers make room,
+/// granting WINDOW_UPDATE credit as they go. Returns `Ready` once anything
+/// moved or was torn down, `Pending` with wakers registered otherwise.
+fn poll_release_held(
+    cx: &mut Context<'_>, streams: &mut HashMap<u32, StreamState>,
+    cmd_tx: &mpsc::Sender<MuxCommand>, window_tx: &mpsc::Sender<MuxCommand>,
+    initial_window_size: u32,
+) -> Poll<()> {
+    let mut progressed = false;
+    let mut closed = Vec::new();
+    for (&stream_id, state) in streams.iter_mut() {
+        while !state.held.is_empty() {
+            let Some(data_tx) = state.data_tx.as_mut() else {
+                break;
+            };
+            match data_tx.poll_reserve(cx) {
+                Poll::Pending => break,
+                Poll::Ready(Err(_)) => {
+                    closed.push(stream_id);
+                    break;
+                }
+                Poll::Ready(Ok(())) => {
+                    let Some(payload) = state.held.pop_front() else {
+                        break;
+                    };
+                    let len = payload.len() as u64;
+                    state.held_bytes -= len;
+                    if data_tx.send_item(payload).is_err() {
+                        closed.push(stream_id);
+                        break;
+                    }
+                    state.credit(stream_id, len, window_tx, initial_window_size);
+                    progressed = true;
+                }
+            }
+        }
+        if state.fin_after_held && state.held.is_empty() {
+            state.fin_after_held = false;
+            state.data_tx = None;
+            progressed = true;
+        }
+    }
+    for stream_id in closed {
+        streams.remove(&stream_id);
+        let _ = cmd_tx.try_send(MuxCommand::CloseStream {
+            stream_id,
+            status: RST_STATUS_FLOW_CONTROL,
+        });
+        progressed = true;
+    }
+    if progressed {
+        Poll::Ready(())
+    } else {
+        Poll::Pending
+    }
 }
 
 /// Owns a shard of streams partitioned by `stream_id % FRAME_WORKERS`.
@@ -70,6 +219,9 @@ pub(super) async fn run_frame_worker(
                 Some(r) => apply_registration(r, &mut streams, &mut pending_replies, &control_tx),
                 None => break,
             },
+            () = poll_fn(|cx| poll_release_held(
+                cx, &mut streams, &control_tx, &window_tx, initial_window_size,
+            )) => {},
             frame = frame_rx.recv() => match frame {
                 Some(f) => dispatch_frame_in_worker(
                     f, &mut streams, &mut pending_replies,
@@ -114,61 +266,19 @@ pub(super) fn dispatch_frame_in_worker(
             fin,
         } => {
             if !payload.is_empty() {
-                let payload_len = payload.len() as u64;
-
                 // session-level recv window is tracked by the reader (not
                 // here).
-                let mut remove = false;
-
                 if let Some(state) = streams.get_mut(&stream_id) {
-                    // Only send data if the data_tx is still open (not
-                    // half-closed)
-                    if let Some(ref data_tx) = state.data_tx {
-                        match data_tx.try_send(payload) {
-                            Ok(()) => {
-                                // track consumed bytes since last per-stream
-                                // WINDOW_UPDATE.
-                                state.consumed_since_update += payload_len;
-                                if state.consumed_since_update >= (initial_window_size / 2) as u64 {
-                                    let delta = state.consumed_since_update as u32;
-                                    // only reset on success; if the channel is
-                                    // full,
-                                    // accumulate and retry on the next DATA
-                                    // frame.
-                                    if window_tx
-                                        .try_send(MuxCommand::EncodeWindowUpdate {
-                                            stream_id,
-                                            delta,
-                                        })
-                                        .is_ok()
-                                    {
-                                        state.consumed_since_update = 0;
-                                    }
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // on buffer-full: do NOT send RST_STREAM. Stop
-                                // draining frame_rx
-                                // instead; the reader backs up, TCP
-                                // applies backpressure to the peer, the peer
-                                // slows down. The frame
-                                // is "lost" for this try, but the per-stream
-                                // recv window is not
-                                // replenished (no WINDOW_UPDATE),
-                                // so the peer naturally pauses sending to this
-                                // stream.
-                                tracing::debug!(
-                                    stream_id,
-                                    "SPDY stream buffer full, applying backpressure (not RST)"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                remove = true;
-                            }
-                        }
+                    if let Some(status) =
+                        state.deliver(stream_id, payload, window_tx, initial_window_size)
+                    {
+                        streams.remove(&stream_id);
+                        let _ = cmd_tx.try_send(MuxCommand::CloseStream { stream_id, status });
+                        return;
                     }
-                    // if data_tx is None (half-closed), silently ignore. The
-                    // stream entry is kept for WINDOW_UPDATE processing.
+                    // if data_tx is None (half-closed), deliver ignores the
+                    // payload. The stream entry is kept for WINDOW_UPDATE
+                    // processing.
                 } else {
                     // trace level: routinely fires during connection teardown
                     // when late DATA frames arrive for
@@ -185,25 +295,16 @@ pub(super) fn dispatch_frame_in_worker(
                         status: RST_STATUS_INVALID_STREAM,
                     });
                 }
-
-                if remove {
-                    streams.remove(&stream_id);
-                    let _ = cmd_tx.try_send(MuxCommand::CloseStream {
-                        stream_id,
-                        status: RST_STATUS_FLOW_CONTROL,
-                    });
-                    return;
-                }
             }
 
             // half-close: remote FIN means peer is done sending. Close our data
-            // Sender so the consumer reads EOF, but keep the stream
-            // entry alive for outgoing WINDOW_UPDATE processing.
-            // Full cleanup happens when StreamGuard fires Close.
+            // Sender so the consumer reads EOF after every held payload, but
+            // keep the stream entry alive for outgoing WINDOW_UPDATE
+            // processing. Full cleanup happens when StreamGuard fires Close.
             if fin {
                 if let Some(state) = streams.get_mut(&stream_id) {
                     tracing::debug!(stream_id, "SPDY DATA FIN received, half-closing read side");
-                    state.data_tx = None;
+                    state.half_close();
                 }
             }
         }
@@ -229,7 +330,7 @@ pub(super) fn dispatch_frame_in_worker(
             // half-close on SYN_REPLY with FIN
             if fin {
                 if let Some(state) = streams.get_mut(&stream_id) {
-                    state.data_tx = None;
+                    state.half_close();
                 }
             }
         }
@@ -278,7 +379,10 @@ pub(super) fn apply_registration(
             streams.insert(
                 stream_id,
                 StreamState {
-                    data_tx: Some(data_tx),
+                    data_tx: Some(PollSender::new(data_tx)),
+                    held: VecDeque::new(),
+                    held_bytes: 0,
+                    fin_after_held: false,
                     send_window,
                     consumed_since_update: 0,
                 },
