@@ -80,6 +80,7 @@ enum StreamState {
         read_buf: Option<Bytes>,
         read_eof: bool,
         graceful_shutdown: Arc<AtomicBool>,
+        remote_fin: Arc<AtomicBool>,
         guard: StreamGuard,
     },
     /// Terminal state used while moving out of `Unopened` during realize.
@@ -197,6 +198,7 @@ pub(crate) struct OpenedStreamParts {
     pub data_id: u32,
     pub error_id: u32,
     pub send_window: Arc<SendWindow>,
+    pub remote_fin: Arc<AtomicBool>,
     pub ctrl_permit_error: mpsc::OwnedPermit<MuxCommand>,
     pub ctrl_permit_data: mpsc::OwnedPermit<MuxCommand>,
     pub close_reg_permit_error: mpsc::OwnedPermit<StreamRegistration>,
@@ -308,6 +310,7 @@ impl Stream {
                 read_buf,
                 read_eof,
                 graceful_shutdown,
+                remote_fin,
                 guard,
             } => {
                 let opened = OpenedShared {
@@ -315,6 +318,7 @@ impl Stream {
                     write_tx,
                     send_window,
                     graceful_shutdown,
+                    remote_fin,
                     guard,
                 };
                 let shared = Arc::new(parking_lot::Mutex::new(SharedSplitState::Opened(opened)));
@@ -343,10 +347,16 @@ impl Stream {
 
 impl Unpin for Stream {}
 
+/// A channel that closed without the peer's FIN on a dead session is a cut
+/// stream, not an end of stream.
+fn ended_without_fin(remote_fin: &AtomicBool, mux: &MuxHandle) -> bool {
+    !remote_fin.load(Ordering::Acquire) && mux.is_closed()
+}
+
 /// Shared `poll_read` logic for channel-backed streams.
 fn poll_read_channel(
     rx: &mut mpsc::Receiver<Bytes>, read_buf: &mut Option<Bytes>, read_eof: &mut bool,
-    cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+    cx: &mut Context<'_>, buf: &mut ReadBuf<'_>, cut: impl Fn() -> bool,
 ) -> Poll<io::Result<()>> {
     if *read_eof {
         return Poll::Ready(Ok(()));
@@ -374,6 +384,7 @@ fn poll_read_channel(
             }
             Poll::Ready(Ok(()))
         }
+        Poll::Ready(None) if cut() => Poll::Ready(Err(broken_pipe())),
         Poll::Ready(None) => {
             *read_eof = true;
             Poll::Ready(Ok(()))
@@ -396,7 +407,7 @@ fn consume_channel_buf(read_buf: &mut Option<Bytes>, amt: usize) {
 /// Shared `poll_fill_buf` logic for channel-backed streams.
 fn poll_fill_buf_channel<'a>(
     rx: &'a mut mpsc::Receiver<Bytes>, read_buf: &'a mut Option<Bytes>, read_eof: &'a mut bool,
-    cx: &mut Context<'_>,
+    cx: &mut Context<'_>, cut: impl Fn() -> bool,
 ) -> Poll<io::Result<&'a [u8]>> {
     loop {
         if read_buf.as_ref().is_some_and(|b| !b.is_empty()) {
@@ -410,6 +421,7 @@ fn poll_fill_buf_channel<'a>(
         }
         match rx.poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) if cut() => return Poll::Ready(Err(broken_pipe())),
             Poll::Ready(None) => {
                 *read_eof = true;
                 return Poll::Ready(Ok(&[]));
@@ -602,6 +614,7 @@ fn finish_unopened_stream(this: &mut Stream, parts: OpenedStreamParts) {
         read_buf,
         read_eof,
         graceful_shutdown,
+        remote_fin: parts.remote_fin,
         guard,
     };
     drop(release_guard);
@@ -645,8 +658,12 @@ impl AsyncRead for Stream {
                 data_rx,
                 read_buf,
                 read_eof,
+                remote_fin,
+                guard,
                 ..
-            } => poll_read_channel(data_rx, read_buf, read_eof, cx, buf),
+            } => poll_read_channel(data_rx, read_buf, read_eof, cx, buf, || {
+                ended_without_fin(remote_fin, &guard.mux)
+            }),
             StreamState::Unopened { .. } | StreamState::Transitioning => unreachable!(),
         }
     }
@@ -663,8 +680,12 @@ impl AsyncBufRead for Stream {
                 data_rx,
                 read_buf,
                 read_eof,
+                remote_fin,
+                guard,
                 ..
-            } => poll_fill_buf_channel(data_rx, read_buf, read_eof, cx),
+            } => poll_fill_buf_channel(data_rx, read_buf, read_eof, cx, || {
+                ended_without_fin(remote_fin, &guard.mux)
+            }),
             StreamState::Unopened { .. } | StreamState::Transitioning => unreachable!(),
         }
     }
@@ -761,9 +782,10 @@ struct OpenedShared {
     write_tx: PollSender<MuxCommand>,
     send_window: Arc<SendWindow>,
     graceful_shutdown: Arc<AtomicBool>,
+    remote_fin: Arc<AtomicBool>,
     /// Kept alive for its `Drop` impl, which sends RST_STREAM (or skips on
-    /// graceful shutdown) and notifies the workers. Never read directly.
-    #[allow(dead_code)]
+    /// graceful shutdown) and notifies the workers. Its `mux` also tells a
+    /// cut stream apart from a finished one on read.
     guard: StreamGuard,
 }
 
@@ -792,6 +814,7 @@ fn finish_shared_open(guard: &mut SharedSplitState, parts: OpenedStreamParts) {
         write_tx,
         send_window: parts.send_window,
         graceful_shutdown,
+        remote_fin: parts.remote_fin,
         guard: stream_guard,
     });
     drop(u.release_guard);
@@ -837,13 +860,22 @@ impl AsyncRead for DataStream {
         if let Err(e) = ensure_shared_open(&this.shared) {
             return Poll::Ready(Err(e));
         }
+        let shared = &this.shared;
         poll_read_channel(
             &mut this.data_rx,
             &mut this.read_buf,
             &mut this.read_eof,
             cx,
             buf,
+            || shared_ended_without_fin(shared),
         )
+    }
+}
+
+fn shared_ended_without_fin(shared: &parking_lot::Mutex<SharedSplitState>) -> bool {
+    match &*shared.lock() {
+        SharedSplitState::Opened(o) => ended_without_fin(&o.remote_fin, &o.guard.mux),
+        SharedSplitState::Unopened(_) | SharedSplitState::Transitioning => false,
     }
 }
 
@@ -853,11 +885,13 @@ impl AsyncBufRead for DataStream {
         if let Err(e) = ensure_shared_open(&this.shared) {
             return Poll::Ready(Err(e));
         }
+        let shared = &this.shared;
         poll_fill_buf_channel(
             &mut this.data_rx,
             &mut this.read_buf,
             &mut this.read_eof,
             cx,
+            || shared_ended_without_fin(shared),
         )
     }
 
@@ -945,6 +979,7 @@ impl AsyncRead for ErrorStream {
             &mut this.error_eof,
             cx,
             buf,
+            || false,
         )
     }
 }
@@ -1743,5 +1778,67 @@ mod tests {
             .expect("shutdown on a dead mux must not hang")
             .expect_err("shutdown on an already-closed mux must not silently succeed");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    async fn read_first_chunk(
+        reader: &mut (impl AsyncRead + Unpin), peer: &mut TestPeer, payload: &[u8], fin: bool,
+    ) {
+        let mut first = [0u8; 16];
+        let peer_fut = async {
+            let _error_id = peer.recv_syn_stream().await;
+            let data_id = peer.recv_syn_stream().await;
+            let _ = peer.recv().await;
+            peer.send_data(data_id, payload, fin);
+        };
+        let (read, ()) = tokio::join!(reader.read(&mut first), peer_fut);
+        assert_eq!(&first[..read.unwrap()], payload);
+    }
+
+    async fn read_rest_after_transport_break(
+        reader: &mut (impl AsyncRead + Unpin), mux: &MuxHandle, peer: TestPeer,
+    ) -> io::Result<Vec<u8>> {
+        drop(peer);
+        assert!(
+            wait_until(|| mux.is_closed(), TEST_TIMEOUT).await,
+            "mux must observe the transport break"
+        );
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).await.map(|_| rest)
+        })
+        .await
+        .expect("read_to_end must not hang on a dead mux")
+    }
+
+    #[tokio::test]
+    async fn transport_break_mid_response_reads_broken_pipe() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux.open_stream_pair(vec![], vec![]).unwrap();
+        read_first_chunk(&mut stream, &mut peer, b"partial", false).await;
+
+        let result = read_rest_after_transport_break(&mut stream, &mux, peer).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn transport_break_mid_response_reads_broken_pipe_on_split_stream() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let (mut data, _errors) = mux.open_stream_pair(vec![], vec![]).unwrap().split();
+        read_first_chunk(&mut data, &mut peer, b"partial", false).await;
+
+        let result = read_rest_after_transport_break(&mut data, &mux, peer).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn fin_before_transport_break_still_reads_clean_eof() {
+        let (mux, mut peer) = spawn_test_peer(test_config()).await;
+        let mut stream = mux.open_stream_pair(vec![], vec![]).unwrap();
+        read_first_chunk(&mut stream, &mut peer, b"complete", true).await;
+
+        let rest = read_rest_after_transport_break(&mut stream, &mux, peer)
+            .await
+            .expect("a stream the peer finished must end with a clean eof");
+        assert_eq!(rest, b"");
     }
 }
