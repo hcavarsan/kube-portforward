@@ -1744,4 +1744,48 @@ mod tests {
             .expect_err("shutdown on an already-closed mux must not silently succeed");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
+
+    #[tokio::test]
+    async fn silent_peer_closes_the_session_after_ping_timeout() {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (ws_write, ws_read) = split_raw_spdy(client);
+        tokio::spawn(async move {
+            let (mut read_half, mut write_half) = tokio::io::split(server);
+            let mut codec = SpdyCodec::with_max_frame_size(TEST_MAX_FRAME);
+            let mut buf = BytesMut::with_capacity(16 * 1024);
+            let mut chunk = [0u8; 4096];
+            let mut answered_handshake = false;
+            loop {
+                let n = match read_half.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                while let Ok(Some(frame)) = codec.decode_frame(&mut buf) {
+                    if let Frame::Ping { id } = frame
+                        && !answered_handshake
+                    {
+                        answered_handshake = true;
+                        let pong = codec.encode_ping(id);
+                        let _ = write_half.write_all(&pong).await;
+                    }
+                }
+            }
+        });
+        let config = MuxConfig {
+            idle_timeout: Duration::from_millis(200),
+            ping_timeout: Duration::from_millis(200),
+            ping_interval: Duration::from_secs(3600),
+            write_timeout: TEST_TIMEOUT,
+            ..MuxConfig::default()
+        };
+        let mux = MuxHandle::spawn(ws_write, ws_read, CancellationToken::new(), config)
+            .await
+            .expect("mux handshake");
+
+        assert!(
+            wait_until(|| mux.is_closed(), Duration::from_secs(2)).await,
+            "a peer that never answers the idle probe must close the session"
+        );
+    }
 }

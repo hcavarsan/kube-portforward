@@ -120,13 +120,10 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
         let time_since_last = last_frame_time.elapsed();
         let idle_remaining = idle_timeout.saturating_sub(time_since_last);
 
-        // check ping timeout if we sent an idle probe
-        if let Some(sent_at) = idle_probe_sent_at {
-            if sent_at.elapsed() >= ping_timeout {
-                tracing::warn!("SPDY reader: ping timeout after {ping_timeout:?}, tearing down");
-                break;
-            }
-        }
+        // once the idle probe is out, the peer has ping_timeout to send
+        // anything back. The deadline is its own select arm so a peer that
+        // goes silent still trips it.
+        let probe_deadline = idle_probe_sent_at.map(|sent_at| sent_at + ping_timeout);
 
         tokio::select! {
             biased;
@@ -142,6 +139,11 @@ pub(super) async fn run_reader<R: WsFrameReader>(parts: ReaderParts<R>, config: 
                 let _ = channels.control_tx.try_send(MuxCommand::EncodePing { id: 0xFFFF_FFFD });
                 idle_ping_sent = true;
                 idle_probe_sent_at = Some(tokio::time::Instant::now());
+            }
+
+            () = tokio::time::sleep_until(probe_deadline.unwrap_or_else(tokio::time::Instant::now)), if probe_deadline.is_some() => {
+                tracing::warn!("SPDY reader: ping timeout after {ping_timeout:?}, tearing down");
+                break;
             }
 
             msg = ws_read.read_message() => {
